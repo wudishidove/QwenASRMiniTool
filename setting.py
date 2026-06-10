@@ -88,6 +88,9 @@ class SettingsTab(ctk.CTkScrollableFrame):
     # ══ 建構 UI ══════════════════════════════════════════════════════
 
     def _build(self):
+        self._build_update_section()
+        _hsep(self)
+
         if self._show_service:
             self._build_service_section()
             _hsep(self)
@@ -108,6 +111,195 @@ class SettingsTab(ctk.CTkScrollableFrame):
         _hsep(self)
 
         self._build_ffmpeg_section()
+
+    # ── 0. 版本與線上更新 ─────────────────────────────────────────────
+
+    def _build_update_section(self):
+        try:
+            from version import __version__ as _ver
+        except Exception:
+            _ver = "?"
+        self._app_version = _ver
+
+        ctk.CTkLabel(
+            self, text="🔄 版本與更新",
+            font=("Microsoft JhengHei", 14, "bold"), anchor="w",
+        ).pack(fill="x", padx=12, pady=(12, 4))
+
+        row = ctk.CTkFrame(self, fg_color="transparent")
+        row.pack(fill="x", padx=12, pady=(0, 4))
+
+        ctk.CTkLabel(
+            row, text=f"目前版本：v{_ver}", font=FONT_BODY, anchor="w",
+        ).pack(side="left")
+
+        self._upd_check_btn = ctk.CTkButton(
+            row, text="🔍 檢查更新", width=110, height=30, font=FONT_BODY,
+            command=self._on_check_update,
+        )
+        self._upd_check_btn.pack(side="right")
+
+        # 狀態文字（檢查結果 / 下載進度訊息）
+        self._upd_status = ctk.CTkLabel(
+            self, text="", font=FONT_SMALL,
+            text_color=("gray40", "#AAAAAA"), anchor="w", justify="left",
+            wraplength=520,
+        )
+        self._upd_status.pack(fill="x", padx=12, pady=(0, 2))
+
+        # 進度條（下載時才顯示）
+        self._upd_prog = ctk.CTkProgressBar(self, height=10)
+        self._upd_prog.set(0)
+
+        # 「立即更新」按鈕（發現新版時才顯示）
+        self._upd_action_row = ctk.CTkFrame(self, fg_color="transparent")
+        self._upd_do_btn = ctk.CTkButton(
+            self._upd_action_row, text="⬇ 立即更新並重啟",
+            width=170, height=32, font=FONT_BODY,
+            fg_color=("#2563eb", "#1d4ed8"), hover_color=("#1d4ed8", "#1e40af"),
+            command=self._on_do_update,
+        )
+        self._upd_do_btn.pack(side="left", padx=(0, 8))
+        self._upd_page_btn = ctk.CTkButton(
+            self._upd_action_row, text="🌐 發行頁",
+            width=90, height=32, font=FONT_BODY,
+            fg_color=("gray70", "gray35"), hover_color=("gray60", "gray28"),
+            command=self._on_open_release_page,
+        )
+        self._upd_page_btn.pack(side="left")
+
+        # 狀態暫存
+        self._upd_info: dict | None = None
+
+    def _set_upd_status(self, text: str, color=None):
+        def _do():
+            self._upd_status.configure(
+                text=text,
+                text_color=color or ("gray40", "#AAAAAA"),
+            )
+        try:
+            self.after(0, _do)
+        except Exception:
+            pass
+
+    def _on_open_release_page(self):
+        url = (self._upd_info or {}).get("html_url") if self._upd_info else None
+        if not url:
+            try:
+                from version import GITHUB_RELEASES_PAGE
+                url = GITHUB_RELEASES_PAGE
+            except Exception:
+                return
+        webbrowser.open(url)
+
+    def _on_check_update(self):
+        self._upd_check_btn.configure(state="disabled", text="檢查中…")
+        self._upd_action_row.pack_forget()
+        self._set_upd_status("正在向 GitHub 查詢最新版本…")
+
+        def _worker():
+            try:
+                import updater
+                info = updater.check_latest()
+            except Exception as e:  # 連匯入都失敗（極少見）
+                info = {"ok": False, "error": str(e)}
+            self.after(0, lambda: self._after_check(info))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _after_check(self, info: dict):
+        self._upd_check_btn.configure(state="normal", text="🔍 檢查更新")
+        self._upd_info = info
+
+        if not info.get("ok"):
+            self._set_upd_status(
+                f"❌ 檢查失敗：{info.get('error', '未知錯誤')}",
+                color=("#b91c1c", "#f87171"),
+            )
+            return
+
+        latest = info.get("latest_tag", "?")
+        if not info.get("has_update"):
+            self._set_upd_status(
+                f"✅ 已是最新版本（最新發佈：{latest}）",
+                color=("#15803d", "#4ade80"),
+            )
+            return
+
+        # 有更新
+        body = (info.get("body") or "").strip()
+        body_short = (body[:200] + "…") if len(body) > 200 else body
+        msg = f"🎉 發現新版本 {latest}"
+        if body_short:
+            msg += f"\n更新說明：{body_short}"
+        if not info.get("asset_url"):
+            msg += "\n（此版本未附可自動更新的套件，請手動下載）"
+        self._set_upd_status(msg, color=("#1d4ed8", "#93c5fd"))
+
+        # 顯示動作列；無套件時禁用「立即更新」
+        self._upd_action_row.pack(fill="x", padx=12, pady=(4, 6))
+        if info.get("asset_url"):
+            self._upd_do_btn.configure(state="normal")
+        else:
+            self._upd_do_btn.configure(state="disabled")
+
+    def _on_do_update(self):
+        import updater
+        info = self._upd_info or {}
+        url, name = info.get("asset_url"), info.get("asset_name")
+        if not url or not name:
+            return
+
+        if not updater.is_frozen():
+            self._set_upd_status(
+                "⚠ 開發模式不支援自我更新，請改用 build.bat 重新編譯。",
+                color=("#b45309", "#fbbf24"),
+            )
+            return
+
+        self._upd_do_btn.configure(state="disabled", text="下載中…")
+        self._upd_check_btn.configure(state="disabled")
+        self._upd_prog.pack(fill="x", padx=12, pady=(2, 6))
+        self._upd_prog.set(0)
+
+        def _prog(done: int, total: int):
+            if total:
+                pct = done / total
+                self.after(0, lambda: self._upd_prog.set(pct))
+                self.after(0, lambda: self._set_upd_status(
+                    f"下載中… {done/1_048_576:.1f} / {total/1_048_576:.1f} MB"))
+
+        def _worker():
+            try:
+                archive = updater.download_asset(url, name, progress_cb=_prog)
+                self._set_upd_status("下載完成，正在準備更新…")
+                bat = updater.apply_update(archive, relaunch=True)
+                self._set_upd_status("即將關閉並套用更新，請稍候…")
+                updater.launch_and_exit(bat)
+                # launch 後關閉本程式，讓 helper bat 完成覆蓋與重啟
+                self.after(400, self._exit_for_update)
+            except Exception as e:
+                self.after(0, lambda: self._after_update_fail(str(e)))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _after_update_fail(self, err: str):
+        self._upd_prog.pack_forget()
+        self._upd_do_btn.configure(state="normal", text="⬇ 立即更新並重啟")
+        self._upd_check_btn.configure(state="normal")
+        self._set_upd_status(
+            f"❌ 更新失敗：{err}", color=("#b91c1c", "#f87171"))
+
+    def _exit_for_update(self):
+        """關閉應用程式，讓 helper bat 接手覆蓋檔案。"""
+        try:
+            self.stop_service()
+        except Exception:
+            pass
+        try:
+            self._app.destroy()
+        finally:
+            os._exit(0)
 
     # ── 1. Streamlit 服務 ─────────────────────────────────────────────
 

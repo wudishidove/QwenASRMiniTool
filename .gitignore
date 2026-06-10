@@ -6,9 +6,12 @@ __pycache__/
 .Python
 *.egg-info/
 dist/
+dist2/
 build/
 *.spec
 results/
+# ── 發行 ZIP（make_release_zip.bat 產生，上傳至 GitHub Releases）──
+QwenASR_*.zip
 
 # ── 虛擬環境 ─────────────────────────────────────────
 venv/
@@ -49,6 +52,7 @@ installer/
 !build.bat
 !build_venv.bat
 !start-gpu.bat
+!make_release_zip.bat
 
 # ── 開發/測試用腳本 ──────────────────────────────────
 test_*.py

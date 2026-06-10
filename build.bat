@@ -2,16 +2,19 @@
 REM =======================================================
 REM  Qwen3 ASR - PyInstaller Build Script (onedir mode)
 REM
-REM  OUTPUT STRUCTURE:
-REM    dist\QwenASR\
-REM      QwenASR.exe        <- launcher (~5 MB)
+REM  OUTPUT STRUCTURE (dist2\):
+REM    dist2\QwenASR\
+REM      QwenASR.exe        <- launcher (~5 MB), CPU / Vulkan edition
 REM      prompt_template.json
 REM      _internal\         <- Python runtime + packages
+REM      chatllm\           <- v2026.05 chatllm binaries (GPU/CPU backend)
+REM      ffmpeg\            <- bundled ffmpeg.exe (video support)
+REM      start-gpu.bat + app-gpu.py + *.py  <- GPU (PyTorch CUDA) edition
 REM
 REM  DISTRIBUTION:
-REM    Run setup.iss with Inno Setup to produce
-REM    QwenASR_Setup.exe (~400 MB installer).
-REM    Models (~1.2 GB) are downloaded at first run.
+REM    Run make_release_zip.bat to produce QwenASR_<version>.zip for a
+REM    GitHub Release. The in-app updater (Settings tab) downloads and
+REM    applies that ZIP. Models (~2.3 GB) are downloaded at first run.
 REM
 REM  STARTUP TIME:
 REM    onedir  -> 3-5 s  (DLLs loaded directly)
@@ -77,6 +80,7 @@ REM Chinese Windows (cp950 default encoding).
     --onedir ^
     --windowed ^
     --name "QwenASR" ^
+    --distpath "%SRC%\dist2" ^
     --icon NONE ^
     --add-data "%CTK_DIR%;customtkinter" ^
     --add-data "%OPENCC_DIR%;opencc" ^
@@ -116,68 +120,71 @@ REM Chinese Windows (cp950 default encoding).
     --add-data "%SRC%\ffmpeg_utils.py;." ^
     --add-data "%SRC%\subtitle_editor.py;." ^
     --add-data "%SRC%\setting.py;." ^
+    --add-data "%SRC%\version.py;." ^
+    --add-data "%SRC%\updater.py;." ^
+    --hidden-import version ^
+    --hidden-import updater ^
     %SRC%\app.py
 
 echo.
-IF EXIST "%SRC%\dist\QwenASR\QwenASR.exe" (
+IF EXIST "%SRC%\dist2\QwenASR\QwenASR.exe" (
     echo ===================================================
-    echo  Build SUCCESS - Copying chatllm DLLs...
+    echo  Build SUCCESS - Copying chatllm + GPU scripts...
     echo ===================================================
 
-    REM Copy chatllm DLLs + main.exe to dist\QwenASR\chatllm\
-    REM These are needed for Vulkan GPU backend (libchatllm.dll, ggml-vulkan.dll, etc.)
-    REM  libchatllm.dll  - newly built (2026-02-23), supports ASR models
-    REM  ggml-vulkan.dll - Vulkan GPU backend (52 MB shader kernels)
-    REM  ggml-cpu-*.dll  - CPU fallback variants (selected at runtime)
-    REM  main.exe        - used for --show_devices GPU detection only
-
-    IF EXIST "%SRC%\chatllm" (
-        xcopy "%SRC%\chatllm\libchatllm.dll"         "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml.dll"               "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml-base.dll"          "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml-cpu-alderlake.dll" "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml-cpu-haswell.dll"   "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml-cpu-icelake.dll"   "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml-cpu-sandybridge.dll" "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml-cpu-skylakex.dll"  "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml-cpu-sse42.dll"     "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml-cpu-x64.dll"       "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml-rpc.dll"           "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\ggml-vulkan.dll"        "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\libcrypto-1_1-x64.dll"  "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\libssl-1_1-x64.dll"     "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\vulkan-1.dll"            "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        xcopy "%SRC%\chatllm\main.exe"               "%SRC%\dist\QwenASR\chatllm\" /Y /Q
-        echo  chatllm/    : DLLs copied to dist\QwenASR\chatllm\
+    REM Copy the ENTIRE chatllm folder (v2026.05 release binaries) to
+    REM dist2\QwenASR\chatllm\. These power the Vulkan GPU + CPU backend
+    REM (libchatllm.dll loaded via ctypes; main.exe for --show_devices).
+    REM Whole-folder copy keeps every ggml-cpu-* variant and stays in sync
+    REM with future chatllm releases without editing this script.
+    IF EXIST "%SRC%\chatllm\libchatllm.dll" (
+        xcopy "%SRC%\chatllm\*" "%SRC%\dist2\QwenASR\chatllm\" /E /I /Y /Q
+        echo  chatllm/    : full folder copied to dist2\QwenASR\chatllm\
     ) ELSE (
-        echo  WARNING: chatllm\ not found - GPU backend will not be available
-        echo  Copy chatllm DLLs to %SRC%\chatllm\ before building.
+        echo  WARNING: chatllm\libchatllm.dll not found - GPU backend unavailable
+        echo  Place the chatllm release binaries in %SRC%\chatllm\ before building.
     )
 
     echo.
-    REM Copy bundled ffmpeg.exe to dist\QwenASR\ffmpeg\
+    REM Copy bundled ffmpeg.exe to dist2\QwenASR\ffmpeg\
     REM ffmpeg_utils.find_ffmpeg() searches <exe_dir>/ffmpeg/ffmpeg.exe first
     REM when running as a frozen EXE (sys.frozen=True).
     IF EXIST "%SRC%\ffmpeg\ffmpeg.exe" (
-        IF NOT EXIST "%SRC%\dist\QwenASR\ffmpeg\" mkdir "%SRC%\dist\QwenASR\ffmpeg\"
-        xcopy "%SRC%\ffmpeg\ffmpeg.exe" "%SRC%\dist\QwenASR\ffmpeg\" /Y /Q
-        echo  ffmpeg/     : ffmpeg.exe copied to dist\QwenASR\ffmpeg\
+        IF NOT EXIST "%SRC%\dist2\QwenASR\ffmpeg\" mkdir "%SRC%\dist2\QwenASR\ffmpeg\"
+        xcopy "%SRC%\ffmpeg\ffmpeg.exe" "%SRC%\dist2\QwenASR\ffmpeg\" /Y /Q
+        echo  ffmpeg/     : ffmpeg.exe copied to dist2\QwenASR\ffmpeg\
     ) ELSE (
         echo  WARNING: ffmpeg\ffmpeg.exe not found - users will be prompted to download at runtime
     )
 
-    echo  Launcher : dist\QwenASR\QwenASR.exe
-    echo  Runtime  : dist\QwenASR\_internal\
-    echo  GPU DLLs : dist\QwenASR\chatllm\   (~71 MB, Vulkan backend)
-    echo  ffmpeg   : dist\QwenASR\ffmpeg\ffmpeg.exe  (video support)
-    echo  WebUI    : use app-gpu.py (start-gpu.bat) for Streamlit service
+    echo.
+    REM ===== GPU edition scripts (PyTorch CUDA, runs on system Python) =====
+    REM These are NOT frozen into the EXE. start-gpu.bat builds a venv-gpu
+    REM and downloads the GPU model on first run. The loose .py sources that
+    REM app-gpu.py / streamlit_vulkan.py import are copied to the app ROOT so
+    REM start-gpu.bat (SCRIPT_DIR = root) can find GPUModel\, ov_models\ and
+    REM app-gpu.py beside itself - exactly as in the source repo layout.
+    FOR %%F IN (app-gpu.py streamlit_vulkan.py streamlit_app.py subtitle_editor.py batch_tab.py diarize.py ffmpeg_utils.py chatllm_engine.py processor_numpy.py downloader.py generate_srt.py version.py updater.py requirements-gpu.txt start-gpu.bat) DO IF EXIST "%SRC%\%%F" xcopy "%SRC%\%%F" "%SRC%\dist2\QwenASR\" /Y /Q >nul
+    REM setting.py / prompt_template.json already live inside _internal\ for the
+    REM frozen app; copy loose versions to root too so the GPU app imports them.
+    IF EXIST "%SRC%\setting.py"          xcopy "%SRC%\setting.py"          "%SRC%\dist2\QwenASR\" /Y /Q >nul
+    IF EXIST "%SRC%\prompt_template.json" xcopy "%SRC%\prompt_template.json" "%SRC%\dist2\QwenASR\" /Y /Q >nul
+    echo  GPU edn     : scripts copied to app root (start-gpu.bat, app-gpu.py)
+
+    echo.
+    echo  Launcher : dist2\QwenASR\QwenASR.exe   (CPU / Vulkan edition)
+    echo  Runtime  : dist2\QwenASR\_internal\
+    echo  GPU DLLs : dist2\QwenASR\chatllm\      (~71 MB, Vulkan backend)
+    echo  ffmpeg   : dist2\QwenASR\ffmpeg\ffmpeg.exe  (video support)
+    echo  GPU edn  : dist2\QwenASR\start-gpu.bat (PyTorch CUDA, app-gpu.py)
+    echo  Update   : in-app check in Settings tab (GitHub Releases)
     echo.
     echo  Model downloaded at first run from:
     echo    https://huggingface.co/dseditor/Collection/resolve/main/qwen3-asr-1.7b.bin
     echo  Saved to: {app}\GPUModel\qwen3-asr-1.7b.bin  (~2.3 GB)
     echo.
-    echo  Next step: open setup.iss with Inno Setup
-    echo  to produce QwenASR_Setup.exe for distribution.
+    echo  Next step: run make_release_zip.bat to produce
+    echo  QwenASR_^<version^>.zip for a GitHub Release (auto-update source).
     echo ===================================================
 ) ELSE (
     echo ===================================================
