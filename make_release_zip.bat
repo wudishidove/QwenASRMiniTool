@@ -42,9 +42,13 @@ IF EXIST "%STAGE%" rmdir /S /Q "%STAGE%"
 mkdir "%STAGE%\QwenASR"
 
 REM robocopy mirrors the app dir but skips large / per-user folders.
-REM /XD = exclude these directories anywhere in the tree.
+REM IMPORTANT: ov_models must be excluded ONLY at the app root (the user's
+REM downloaded models). Use its FULL PATH here - a bare name would also match
+REM _internal\ov_models\ and strip the bundled mel_filters.npy / silero_vad
+REM that the OpenVINO processor needs, breaking fresh installs.
+REM __pycache__ stays name-based (should be excluded everywhere).
 robocopy "%APPDIR%" "%STAGE%\QwenASR" /E ^
-    /XD "GPUModel" "ov_models" "venv-gpu" "venv" "subtitles" "__pycache__" "cloudflared" ^
+    /XD "%APPDIR%\ov_models" "%APPDIR%\GPUModel" "%APPDIR%\venv-gpu" "%APPDIR%\venv" "%APPDIR%\subtitles" "%APPDIR%\cloudflared" "__pycache__" ^
     /XF "settings.json" "*.log" ^
     /NFL /NDL /NJH /NJS /NP >nul
 
