@@ -312,6 +312,155 @@ def download_1p7b(model_dir: Path, progress_cb=None):
 
 
 # ══════════════════════════════════════════════════════════════════════
+# CrispASR(Whisper) 核心 + Breeze-ASR-26 GGML 模型（按需下載，不進 EXE）
+# ══════════════════════════════════════════════════════════════════════
+
+# 已測試完成的 CrispASR Windows Vulkan 版（v0.7.2）
+_CRISPASR_ZIP_URL = ("https://github.com/CrispStrobe/CrispASR/releases/"
+                     "download/v0.7.2/crispasr-windows-x86_64-vulkan.zip")
+
+# Breeze-ASR-26 GGML（phate334）三種量化
+_BREEZE_REPO  = "phate334/Breeze-ASR-26-GGML"
+_BREEZE_BASE  = f"https://huggingface.co/{_BREEZE_REPO}/resolve/main"
+_BREEZE_FILES = {
+    "q4": "ggml-model-q4_0.bin",   # 輕量 ~889 MB
+    "q5": "ggml-model-q5_0.bin",   # 標準 ~1.08 GB
+    "q8": "ggml-model-q8_0.bin",   # 精確 ~1.66 GB
+}
+
+
+def breeze_filename(quant: str) -> str:
+    """量化代碼（q4/q5/q8）→ Breeze GGML 檔名（未知時回傳 q5 標準）。"""
+    return _BREEZE_FILES.get(quant, _BREEZE_FILES["q5"])
+
+
+def quick_check_crispasr(crispasr_dir: Path) -> bool:
+    """CrispASR 核心是否就緒（crispasr.exe 存在，含一層子資料夾）。"""
+    if (crispasr_dir / "crispasr.exe").exists():
+        return True
+    return any(crispasr_dir.glob("**/crispasr.exe"))
+
+
+def download_crispasr_core(crispasr_dir: Path, progress_cb=None):
+    """下載 CrispASR Vulkan zip 並解壓（扁平化）至 crispasr_dir。
+
+    progress_cb(pct: float, msg: str)。GitHub 來源不套用 HF 鏡像。
+    """
+    import shutil
+    import tempfile
+    import zipfile
+
+    crispasr_dir.mkdir(parents=True, exist_ok=True)
+    if progress_cb:
+        progress_cb(0.0, "下載 CrispASR 核心（Vulkan）…")
+
+    def _cb(done: int, total_b: int):
+        if progress_cb and total_b > 0:
+            progress_cb(
+                0.9 * done / total_b,
+                f"下載核心…  {done/1_048_576:.0f} / {total_b/1_048_576:.0f} MB",
+            )
+
+    with tempfile.TemporaryDirectory() as td:
+        zpath = Path(td) / "crispasr-vulkan.zip"
+        _download_file(_CRISPASR_ZIP_URL, zpath, progress_cb=_cb)
+        if progress_cb:
+            progress_cb(0.92, "解壓 CrispASR 核心…")
+        with zipfile.ZipFile(zpath) as z:
+            z.extractall(td)
+        # 扁平化：所有 .exe / .dll 移到 crispasr_dir 根目錄
+        for f in Path(td).glob("**/*"):
+            if f.is_file() and f.suffix.lower() in (".exe", ".dll"):
+                shutil.copy(f, crispasr_dir / f.name)
+
+    if not quick_check_crispasr(crispasr_dir):
+        raise RuntimeError("CrispASR 核心解壓後仍找不到 crispasr.exe")
+    if progress_cb:
+        progress_cb(1.0, "CrispASR 核心就緒")
+
+
+def quick_check_breeze(crispasr_dir: Path, quant: str) -> bool:
+    """指定量化的 Breeze 模型是否存在（排除 LFS pointer）。"""
+    return _file_is_real(crispasr_dir / breeze_filename(quant))
+
+
+def download_breeze(crispasr_dir: Path, quant: str, progress_cb=None):
+    """下載指定量化的 Breeze-ASR-26 GGML 模型至 crispasr_dir。
+
+    progress_cb(pct: float, msg: str)。支援斷點續傳與 HF 鏡像。
+    """
+    crispasr_dir.mkdir(parents=True, exist_ok=True)
+    fname = breeze_filename(quant)
+    dest  = crispasr_dir / fname
+    if _file_is_real(dest):
+        if progress_cb:
+            progress_cb(1.0, f"{fname} 已存在")
+        return
+
+    def _cb(done: int, total_b: int):
+        if progress_cb and total_b > 0:
+            progress_cb(
+                done / total_b,
+                f"下載 {fname}…  {done/1_048_576:.0f} / {total_b/1_048_576:.0f} MB",
+            )
+
+    _download_file(f"{_BREEZE_BASE}/{fname}", dest, progress_cb=_cb)
+    if progress_cb:
+        progress_cb(1.0, f"✅ {fname}")
+
+
+# ── qwen3 ForcedAligner GGUF（CrispASR -am 對齊器，Whisper 核心專用 FA）──
+# crispasr.exe -am <gguf> -falign：用 CTC 對齊器的字級時間軸覆蓋 whisper 自帶
+# 的（較粗）時間戳。同作者(cstr)上傳，與 crispasr 的 -am 介面相容。
+_ALIGNER_GGUF_REPO  = "cstr/qwen3-forced-aligner-0.6b-GGUF"
+_ALIGNER_GGUF_BASE  = f"https://huggingface.co/{_ALIGNER_GGUF_REPO}/resolve/main"
+_ALIGNER_GGUF_FILES = {
+    "q4": "qwen3-forced-aligner-0.6b-q4_k.gguf",   # 輕量 ~529 MB
+    "q5": "qwen3-forced-aligner-0.6b-q5_0.gguf",   # 標準 ~643 MB
+    "q8": "qwen3-forced-aligner-0.6b-q8_0.gguf",   # 精確 ~986 MB
+}
+# 對齊（CTC）對量化不敏感，標準 q5 即足夠精確，預設用之。
+_ALIGNER_GGUF_DEFAULT = "q5"
+
+
+def aligner_gguf_filename(quant: str = _ALIGNER_GGUF_DEFAULT) -> str:
+    """量化代碼（q4/q5/q8）→ qwen3 ForcedAligner GGUF 檔名（未知時回傳 q5）。"""
+    return _ALIGNER_GGUF_FILES.get(quant, _ALIGNER_GGUF_FILES[_ALIGNER_GGUF_DEFAULT])
+
+
+def quick_check_aligner_gguf(crispasr_dir: Path,
+                             quant: str = _ALIGNER_GGUF_DEFAULT) -> bool:
+    """指定量化的 ForcedAligner GGUF 是否存在（排除 LFS pointer）。"""
+    return _file_is_real(crispasr_dir / aligner_gguf_filename(quant))
+
+
+def download_aligner_gguf(crispasr_dir: Path,
+                          quant: str = _ALIGNER_GGUF_DEFAULT, progress_cb=None):
+    """下載 qwen3 ForcedAligner GGUF 至 crispasr_dir（與 crispasr.exe 同層）。
+
+    progress_cb(pct: float, msg: str)。支援斷點續傳與 HF 鏡像。
+    """
+    crispasr_dir.mkdir(parents=True, exist_ok=True)
+    fname = aligner_gguf_filename(quant)
+    dest  = crispasr_dir / fname
+    if _file_is_real(dest):
+        if progress_cb:
+            progress_cb(1.0, f"{fname} 已存在")
+        return
+
+    def _cb(done: int, total_b: int):
+        if progress_cb and total_b > 0:
+            progress_cb(
+                done / total_b,
+                f"下載 {fname}…  {done/1_048_576:.0f} / {total_b/1_048_576:.0f} MB",
+            )
+
+    _download_file(f"{_ALIGNER_GGUF_BASE}/{fname}", dest, progress_cb=_cb)
+    if progress_cb:
+        progress_cb(1.0, f"✅ {fname}")
+
+
+# ══════════════════════════════════════════════════════════════════════
 # 完整性檢查
 # ══════════════════════════════════════════════════════════════════════
 

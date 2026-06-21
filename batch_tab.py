@@ -273,7 +273,12 @@ class BatchTab(ctk.CTkFrame):
             command=lambda p=item.path: self._preview(p),
         ).pack(side="left", padx=(0, 2))
 
-        detail_state = "normal" if (item.srt_path and item.srt_path.exists()) else "disabled"
+        # 字幕編輯器僅支援 SRT；純文字（.txt）輸出無時間軸故停用 ⋯ 鈕
+        detail_state = (
+            "normal" if (item.srt_path and item.srt_path.exists()
+                         and item.srt_path.suffix.lower() == ".srt")
+            else "disabled"
+        )
         detail_btn = ctk.CTkButton(
             btn_fr, text="⋯", width=32, height=26,
             fg_color="#2A1A4A", hover_color="#3D2870",
@@ -545,7 +550,8 @@ class BatchTab(ctk.CTkFrame):
             return
         w["status_lbl"].configure(text=item.status, text_color=item.status_color)
         w["pbar"].set(item.progress)
-        if item.srt_path and item.srt_path.exists():
+        if (item.srt_path and item.srt_path.exists()
+                and item.srt_path.suffix.lower() == ".srt"):
             w["detail_btn"].configure(state="normal")
         # 失敗時顯示 tooltip
         if item.status == "失敗" and item.error_msg:
@@ -594,11 +600,18 @@ class BatchTab(ctk.CTkFrame):
         threading.Thread(target=_play, daemon=True).start()
 
     def _open_detail(self, item: BatchItem):
-        if item.srt_path and item.srt_path.exists():
-            self._open_subtitle(item.srt_path, item.path, False)
-        else:
+        if not (item.srt_path and item.srt_path.exists()):
             messagebox.showinfo(
                 "尚未完成", "該音檔尚未辨識完成，無字幕可檢視。", parent=self)
+            return
+        if item.srt_path.suffix.lower() != ".srt":
+            messagebox.showinfo(
+                "純文字輸出",
+                "目前輸出為純文字（.txt），無時間軸可編輯。\n"
+                "若需字幕編輯器，請至「設定 → 輸出格式」改回「SRT 字幕」後重新辨識。",
+                parent=self)
+            return
+        self._open_subtitle(item.srt_path, item.path, False)
 
 
 # ── 輔助函式 ──────────────────────────────────────────────────────────

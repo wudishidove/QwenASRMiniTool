@@ -48,6 +48,15 @@ echo customtkinter     : %CTK_DIR%
 echo openvino          : %OV_PKG%
 echo kaldi_native_fbank: %KNF_DIR%
 
+REM Guard: if any dependency path is empty, the import failed (or printed an
+REM extra stdout line that overwrote the FOR /F variable). Fail loudly here
+REM instead of feeding an empty SOURCE to --add-data (which aborts PyInstaller
+REM yet still leaves a stale exe, causing a false "Build SUCCESS").
+IF "%OPENCC_DIR%"=="" GOTO :dep_failed
+IF "%CTK_DIR%"==""    GOTO :dep_failed
+IF "%OV_PKG%"==""     GOTO :dep_failed
+IF "%KNF_DIR%"==""    GOTO :dep_failed
+
 echo.
 echo === Step 2b: Ensure silero_vad_v4.onnx is present before bundling ===
 REM VAD model must exist locally so --add-data can bundle it into _internal/ov_models/
@@ -76,6 +85,10 @@ REM
 REM runtime_hook_utf8.py: sets PYTHONUTF8=1 before any user code runs.
 REM This prevents "utf-8 codec can't decode byte 0xa6" on Traditional
 REM Chinese Windows (cp950 default encoding).
+
+REM Delete any prior exe so the post-build EXIST check cannot pass on a stale
+REM build if PyInstaller fails to produce a fresh one.
+IF EXIST "%SRC%\dist2\QwenASR\QwenASR.exe" DEL /Q "%SRC%\dist2\QwenASR\QwenASR.exe"
 
 %PYTHON% -m PyInstaller ^
     --onedir ^
@@ -128,6 +141,10 @@ REM Chinese Windows (cp950 default encoding).
     --add-data "%SRC%\fa_aligner.py;." ^
     --add-data "%SRC%\api_server.py;." ^
     --add-data "%SRC%\endpoint_tab.py;." ^
+    --add-data "%SRC%\crisp_engine.py;." ^
+    --add-data "%SRC%\subtitle_lines.py;." ^
+    --hidden-import crisp_engine ^
+    --hidden-import subtitle_lines ^
     --hidden-import version ^
     --hidden-import updater ^
     --hidden-import fa_aligner ^
@@ -135,6 +152,10 @@ REM Chinese Windows (cp950 default encoding).
     --hidden-import endpoint_tab ^
     --hidden-import segno ^
     %SRC%\app.py
+
+REM Catch a real PyInstaller failure immediately. This MUST come before any
+REM other command (echo. resets errorlevel to 0).
+IF ERRORLEVEL 1 GOTO :build_failed
 
 echo.
 REM NOTE: a GOTO flow (not IF (...) ELSE (...)) is used below on purpose.
@@ -200,6 +221,16 @@ GOTO :build_end
 :build_failed
 echo ===================================================
 echo  Build FAILED. Check output above.
+echo ===================================================
+GOTO :build_end
+
+:dep_failed
+echo ===================================================
+echo  Build FAILED: a dependency path is empty.
+echo  One of opencc / customtkinter / openvino / kaldi_native_fbank
+echo  could not be located in the build venv. Retry the build (a cold
+echo  import sometimes emits an extra stdout line), or verify the package
+echo  is installed: %PYTHON% -c "import openvino"
 echo ===================================================
 
 :build_end

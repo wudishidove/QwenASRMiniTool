@@ -31,6 +31,25 @@ FONT_SMALL = ("Microsoft JhengHei", 11)
 FONT_HEAD  = ("Microsoft JhengHei", 14, "bold")
 
 
+# ── 核心 → 模型清單對照（app.py 依標籤字串映射 backend）──────────────
+QWEN_MODELS = [
+    "Qwen3-ASR-0.6B",
+    "Qwen3-ASR-1.7B INT8",
+    "Qwen3-ASR-1.7B Q8 (Vulkan)",
+]
+WHISPER_MODELS = [
+    "Breeze Q4 (輕量)",
+    "Breeze Q5 (標準)",
+    "Breeze Q8 (精確)",
+]
+CORE_QWEN    = "Qwen"
+CORE_WHISPER = "Whisper (Breeze)"
+
+
+def _models_for_core(core: str) -> list[str]:
+    return WHISPER_MODELS if "Whisper" in core else QWEN_MODELS
+
+
 def _hsep(parent):
     """水平分隔線。"""
     ctk.CTkFrame(
@@ -97,18 +116,35 @@ class ModelTab(ctk.CTkScrollableFrame):
             )
             self._app.reload_btn.pack(side="left", padx=(12, 0))
 
-        # 模型選擇列（CPU 版才有）
+        # 核心 + 模型選擇列（CPU 版才有）
         if self._show_model_select:
+            # ── 核心選擇列（Qwen / Whisper）─────────────────────────────
+            crow = ctk.CTkFrame(self, fg_color="transparent")
+            crow.pack(fill="x", padx=12, pady=(0, 4))
+            ctk.CTkLabel(
+                crow, text="核心：", font=FONT_BODY, width=72, anchor="w",
+            ).pack(side="left")
+
+            self._app.core_var   = ctk.StringVar(value=CORE_QWEN)
+            self._app.core_combo = ctk.CTkSegmentedButton(
+                crow, values=[CORE_QWEN, CORE_WHISPER],
+                variable=self._app.core_var, font=FONT_BODY,
+                command=self._on_core_change,
+            )
+            self._app.core_combo.set(CORE_QWEN)
+            self._app.core_combo.pack(side="left", padx=(4, 0))
+
+            # ── 模型選擇列 ───────────────────────────────────────────────
             mrow = ctk.CTkFrame(self, fg_color="transparent")
             mrow.pack(fill="x", padx=12, pady=(0, 4))
             ctk.CTkLabel(
                 mrow, text="模型：", font=FONT_BODY, width=72, anchor="w",
             ).pack(side="left")
 
-            self._app.model_var   = ctk.StringVar(value="Qwen3-ASR-0.6B")
+            self._app.model_var   = ctk.StringVar(value=QWEN_MODELS[0])
             self._app.model_combo = ctk.CTkComboBox(
                 mrow,
-                values=["Qwen3-ASR-0.6B", "Qwen3-ASR-1.7B INT8"],
+                values=QWEN_MODELS,
                 variable=self._app.model_var,
                 width=220, state="readonly", font=FONT_BODY,
             )
@@ -127,6 +163,29 @@ class ModelTab(ctk.CTkScrollableFrame):
             font=FONT_SMALL, text_color=("gray40", "#AAAAAA"), anchor="w",
             wraplength=480, justify="left",
         ).pack(fill="x", padx=12, pady=(0, 6))
+
+    def _on_core_change(self, core: str):
+        """核心切換 → 更新模型下拉清單（恆常可選，預設開放原則）。"""
+        models = _models_for_core(core)
+        try:
+            self._app.model_combo.configure(values=models, state="readonly")
+            if self._app.model_var.get() not in models:
+                self._app.model_var.set(models[0])
+        except Exception:
+            pass
+
+    def set_core(self, core: str):
+        """程式化設定核心並刷新模型清單（app.py 載入完成後同步用）。
+
+        注意：會把 model_var 重設為該核心首項，呼叫端如需指定特定模型，
+        應於本方法後再 self._app.model_var.set(<label>)。
+        """
+        try:
+            self._app.core_var.set(core)
+            self._app.core_combo.set(core)
+        except Exception:
+            pass
+        self._on_core_change(core)
 
     # ── 2. 模型路徑 + 下載來源（鏡像站）──────────────────────────────
 

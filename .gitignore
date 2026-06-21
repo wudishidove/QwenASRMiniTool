@@ -82,6 +82,21 @@ chatllmtest/
 # ── cloudflared（對外通道二進位，隨用下載，不入庫）────────────────────
 cloudflared/
 
+# ── CrispASR / Whisper 核心與測試資料（隨用下載 / 開發測試，不入庫）──────
+crispasr/
+CASRCore/
+_freshtest/
+_freshtest_models/
+crisp_smoke.py
+compress_kv_int4.py
+ov_models/qwen3_asr_1p7b_kv_int4/
+
+# ── 雜項暫存（誤產生 / 工作交接，不入庫）────────────────────────────
+*.stackdump
+工作交接*.md
+UI.txt
+/root
+
 # ── 其他 ─────────────────────────────────────────────
 .claude/
 *.jpg

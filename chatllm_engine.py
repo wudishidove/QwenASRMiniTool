@@ -784,10 +784,16 @@ class ChatLLMASREngine:
         self.use_aligner = False
         self._fa_bin     = None
         # FA .bin 與 ASR .bin 放同一資料夾（尊重使用者指定的 model_dir）
+        # ── FA 強制 CPU 子程序（n_gpu_layers=0）──────────────────────────
+        # 致命關鍵：ASR 走常駐 libchatllm.dll，Vulkan context 永不釋放。
+        # 若 FA 也用 -ngl {id}:all 上 GPU，main.exe 子程序會在 DLL 仍持有
+        # context 時建立「第二個 Vulkan context」→ 同卡雙 context 並存 →
+        # 驅動 TDR/reset → 整機當機（1.0.8 起的潛伏 bug，見 vulkan-dual-context-crash）。
+        # FA 是 0.6B，CPU 對齊本就夠快；改 CPU 後全程僅一個 GPU context（DLL）。
         self._fa = ChatLLMAligner(
             fa_dir       = self._model_path.parent,
             chatllm_dir  = self._chatllm_dir,
-            n_gpu_layers = self._n_gpu_layers,
+            n_gpu_layers = 0,
             device_id    = self._device_id,
         )
         if self._fa.load(cb=cb):
@@ -840,8 +846,10 @@ class ChatLLMASREngine:
         diarize:    bool = False,
         n_speakers: int | None = None,
         original_path: Path | None = None,
+        out_format: str | None = None,
     ) -> Path | None:
         from audio_io import load_audio_16k_mono
+        from subtitle_lines import write_transcript
 
         audio, _ = load_audio_16k_mono(audio_path, SAMPLE_RATE)
 
@@ -946,16 +954,12 @@ class ChatLLMASREngine:
             return None
 
         if progress_cb:
-            progress_cb(total, total, "寫入 SRT…")
+            progress_cb(total, total, "寫入字幕…")
 
         # 以原始檔案的目錄與檔名輸出（影片抽音軌時 audio_path 是暫存路徑）
+        # 共用寫出層：依全域設定（或 out_format 覆寫）產出 .srt 或 .txt。
         ref = original_path if original_path is not None else audio_path
-        out = ref.parent / (ref.stem + ".srt")
-        with open(out, "w", encoding="utf-8") as f:
-            for idx, (s, e, line, spk) in enumerate(all_subs, 1):
-                prefix = f"{spk}：" if spk else ""
-                f.write(f"{idx}\n{_srt_ts(s)} --> {_srt_ts(e)}\n{prefix}{line}\n\n")
-        return out
+        return write_transcript(ref, all_subs, out_format)
 
     def __del__(self):
         pass   # DLL runner 由 GC 自然回收（ctypes callback 會被 GC 清理）

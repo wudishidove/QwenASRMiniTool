@@ -10,12 +10,12 @@
 """
 from __future__ import annotations
 
-# 本次編譯版本（dist2）。1.0.8：模型分頁重構(引擎/裝置/模型/路徑/下載/CPU 集中)、
-# 語系移至設定頁並置頂、標題列狀態摘要、Streamlit 退役(網頁服務統一由端點提供)、
-# 端點網頁重設計+即時錄音(停頓自動上傳)、端點 QR 右側面板/外網優先/可下載、
-# audio_io 取代 librosa(修 numpy 2.4 + numba 衝突，瘦身)、句尾字消失修復
-# (去整秒裁切 + 尾段 0.35s + 瀏覽器停頓門檻 2.2s)。最新已發佈 Release 為 1.0.7。
-__version__ = "1.0.8"
+# 本次編譯版本（dist2）。1.0.9：新增 Whisper/Breeze-ASR-26 推理核心
+# (CrispASR / Vulkan，-nf -bo1 達 ~35x，繁中/台語特化)、qwen3 ForcedAligner
+# GGUF 字級時間軸對齊、核心切換 Vulkan context 防當機修正、字幕分行全引擎統一
+# (subtitle_lines，標點/空白邊界切 + MAX_CHARS 保護 + 孤兒行合併)。
+# 最新已發佈 Release 為 1.0.8。
+__version__ = "1.0.9"
 
 # 自動更新來源：GitHub repo（owner/name）
 GITHUB_REPO = "dseditor/QwenASRMiniTool"

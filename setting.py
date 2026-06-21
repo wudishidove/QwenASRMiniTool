@@ -81,6 +81,9 @@ class SettingsTab(ctk.CTkScrollableFrame):
         self._build_language_section()
         _hsep(self)
 
+        self._build_output_format_section()
+        _hsep(self)
+
         self._build_vad_section()
         _hsep(self)
 
@@ -225,8 +228,22 @@ class SettingsTab(ctk.CTkScrollableFrame):
             return
 
         if not updater.is_frozen():
+            # 非凍結版（從原始碼執行：GPU 版 start-gpu.bat / 直接 python app.py）
+            # 無法自我覆寫檔案，改為開啟發行頁讓使用者手動下載新版套件。
+            page = info.get("html_url")
+            if not page:
+                try:
+                    from version import GITHUB_RELEASES_PAGE
+                    page = GITHUB_RELEASES_PAGE
+                except Exception:
+                    page = None
+            if page:
+                try:
+                    webbrowser.open(page)
+                except Exception:
+                    pass
             self._set_upd_status(
-                "⚠ 開發模式不支援自我更新，請改用 build.bat 重新編譯。",
+                "此為原始碼／GPU 版，無法自動覆寫；已開啟發行頁，請手動下載新版套件更新。",
                 color=("#b45309", "#fbbf24"),
             )
             return
@@ -421,6 +438,41 @@ class SettingsTab(ctk.CTkScrollableFrame):
         except Exception:
             pass
 
+    # ── 3b. 輸出格式（全域：SRT 字幕 / 純文字）────────────────────────────
+
+    def _build_output_format_section(self):
+        ctk.CTkLabel(
+            self, text="📄 輸出格式", font=FONT_BODY, anchor="w",
+        ).pack(fill="x", padx=12, pady=(10, 2))
+
+        ctk.CTkLabel(
+            self,
+            text="選擇辨識結果的儲存格式。此設定對音檔轉字幕、批次辨識、錄製轉換與 API 端點全域生效；"
+                 "選「純文字」時直接輸出 .txt（免進字幕編輯器）。",
+            font=FONT_SMALL, text_color=("gray40", "#AAAAAA"), anchor="w",
+            wraplength=480, justify="left",
+        ).pack(fill="x", padx=12, pady=(0, 4))
+
+        row = ctk.CTkFrame(self, fg_color="transparent")
+        row.pack(fill="x", padx=12, pady=(0, 8))
+
+        ctk.CTkLabel(
+            row, text="格式：", font=FONT_BODY, width=130, anchor="w",
+        ).pack(side="left")
+
+        self._outfmt_seg = ctk.CTkSegmentedButton(
+            row, values=["SRT 字幕", "純文字"],
+            width=200, height=30, font=FONT_BODY,
+            command=self._on_outfmt_seg,
+        )
+        self._outfmt_seg.set("SRT 字幕")
+        self._outfmt_seg.pack(side="left")
+
+    def _on_outfmt_seg(self, value: str):
+        fmt = "txt" if "純文字" in value else "srt"
+        if hasattr(self._app, "_on_output_format_change"):
+            self._app._on_output_format_change(fmt)
+
     # ── 4. VAD 語音偵測阈値 ─────────────────────────────
 
     def _build_vad_section(self):
@@ -522,6 +574,11 @@ class SettingsTab(ctk.CTkScrollableFrame):
         if hasattr(self, "_vocab_var"):
             self._vocab_var.set(bool(settings.get("vocab_convert", True)))
             self._sync_vocab_state()
+
+        # 輸出格式（SRT / 純文字）
+        if hasattr(self, "_outfmt_seg"):
+            fmt = (settings.get("output_format", "srt") or "srt").lower()
+            self._outfmt_seg.set("純文字" if fmt == "txt" else "SRT 字幕")
 
         # 介面縮放
         if hasattr(self, "_scale_seg"):

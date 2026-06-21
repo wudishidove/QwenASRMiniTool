@@ -46,6 +46,58 @@ except Exception:
     ChatLLMASREngine   = None
     def detect_vulkan_devices(_): return []
 
+# ── CrispASR 後端（可選，Whisper/Breeze 走 Vulkan）─────────────────────
+try:
+    from crisp_engine import CrispWhisperEngine
+    _CRISPASR_AVAILABLE = True
+except Exception:
+    _CRISPASR_AVAILABLE = False
+    CrispWhisperEngine  = None
+
+# ── 字幕分行（全引擎共用，與 CrispASR/Whisper 統一）────────────────────
+from subtitle_lines import (
+    MAX_CHARS, _ZH_CLAUSE_END, _EN_SENT_END,
+    _srt_ts, _merge_orphan_lines, _ts_chatllm_to_subtitle_lines,
+    write_transcript,
+)
+import subtitle_lines as _subs
+
+def _resolve_backend(core: str, model_label: str):
+    """(核心, 模型標籤) → (backend, 量化/尺寸)。三層選擇的中央映射。
+
+    回傳：
+      ("crispasr", "q4"|"q5"|"q8")  — Whisper / Breeze
+      ("chatllm",  None)            — Qwen 1.7B Q8 (Vulkan)
+      ("openvino", "1.7B"|"0.6B")   — Qwen OpenVINO
+    """
+    if "Whisper" in core or "Breeze" in model_label:
+        q = "q4" if "Q4" in model_label else "q8" if "Q8" in model_label else "q5"
+        return "crispasr", q
+    if "Q8 (Vulkan)" in model_label:
+        return "chatllm", None
+    if "1.7B INT8" in model_label:
+        return "openvino", "1.7B"
+    return "openvino", "0.6B"
+
+
+def _core_for_backend(backend: str) -> str:
+    """backend → 核心標籤（載入完成後同步 UI 用）。"""
+    return "Whisper (Breeze)" if backend == "crispasr" else "Qwen"
+
+
+def _ui_core_model(settings: dict):
+    """settings → (核心標籤, 模型標籤)，供載入後同步 UI 下拉。"""
+    backend = settings.get("backend", "openvino")
+    if backend == "crispasr":
+        q = settings.get("crisp_quant", "q5")
+        label = {"q4": "Breeze Q4 (輕量)", "q5": "Breeze Q5 (標準)",
+                 "q8": "Breeze Q8 (精確)"}.get(q, "Breeze Q5 (標準)")
+        return "Whisper (Breeze)", label
+    if backend == "chatllm":
+        return "Qwen", "Qwen3-ASR-1.7B Q8 (Vulkan)"
+    sz = settings.get("cpu_model_size", "0.6B")
+    return "Qwen", ("Qwen3-ASR-1.7B INT8" if "1.7B" in sz else "Qwen3-ASR-0.6B")
+
 # ── 路徑 ──────────────────────────────────────────────
 # PyInstaller 凍結時，模型應放在 EXE 旁邊（非 _internal/）
 if getattr(sys, "frozen", False):
@@ -71,7 +123,6 @@ SAMPLE_RATE   = 16000
 VAD_CHUNK     = 512
 VAD_THRESHOLD = 0.5   # 可由設定頁調整（降低可減少掴字）
 MAX_GROUP_SEC = 20
-MAX_CHARS     = 20
 MIN_SUB_SEC   = 0.6
 GAP_SEC       = 0.08
 
@@ -82,11 +133,7 @@ RT_MAX_BUFFER_CHUNKS = 600  # ~19s 上限強制轉錄
 GPU_MODEL_DIR      = BASE_DIR / "GPUModel"
 ALIGNER_MODEL_NAME = "Qwen3-ForcedAligner-0.6B"
 
-# ── 斷句標點集合（ForcedAligner 使用）──────────────────────────────
-# 中文子句結束標點（不保留，切行後隱藏）
-_ZH_CLAUSE_END = frozenset('，。？！；：…—、·')
-# 英文子句結束標點（含逗號，讓英文逗號也觸發切行）
-_EN_SENT_END   = frozenset('.,!?;')
+# 斷句標點集合 _ZH_CLAUSE_END / _EN_SENT_END 已移至 subtitle_lines（共用）
 
 
 # ══════════════════════════════════════════════════════
@@ -221,12 +268,7 @@ def _split_to_lines(text: str) -> list[str]:
 
 
 
-def _srt_ts(s: float) -> str:
-    ms = int(round(s * 1000))
-    hh = ms // 3_600_000; ms %= 3_600_000
-    mm = ms // 60_000;    ms %= 60_000
-    ss = ms // 1_000;     ms %= 1_000
-    return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
+# _srt_ts 已移至 subtitle_lines（共用）
 
 
 def _assign_ts(lines: list[str], g0: float, g1: float) -> list[tuple[float, float, str]]:
@@ -259,57 +301,7 @@ def _find_vad_model() -> Path | None:
     return None
 
 
-def _merge_orphan_lines(
-    lines: list[tuple[float, float, str, str | None]],
-    min_chars: int = 1,
-    max_gap: float = 0.8,
-) -> list[tuple[float, float, str, str | None]]:
-    """合併過短的孤立字幕行（如句尾「吧」單獨成行）到相鄰行。
-
-    FA 斷句時 MAX_WORDS 與標點切行偶爾會疊加，在子句中間切一刀，把
-    句尾語助詞（吧/啊/呢/了…）留成獨立一行。此處在輸出前把這類「孤兒行」
-    併回相鄰行：優先併入前一行（時間連續、同說話者），首行孤兒則併入下一行。
-    含拉丁詞時以空格 join，純中文直接相接。
-
-    預設僅併「單字」孤兒：單字幾乎都是句尾語助詞，向後併入前一行最安全；
-    兩字以上可能是句首短詞，向後併易誤接，故不處理。
-    """
-    if not lines:
-        return lines
-
-    def _has_latin(t: str) -> bool:
-        return any(c.isascii() and c.isalpha() for c in t)
-
-    def _vlen(t: str) -> int:
-        return len(t.replace(" ", ""))
-
-    def _is_orphan(t: str) -> bool:
-        # 純中文且可見字數極少才視為孤兒；含拉丁詞（英文/數字詞）不併
-        return (not _has_latin(t)) and 0 < _vlen(t) <= min_chars
-
-    def _join(a: str, b: str) -> str:
-        sep = " " if (_has_latin(a) or _has_latin(b)) else ""
-        return f"{a}{sep}{b}"
-
-    merged: list[tuple[float, float, str, str | None]] = []
-    for (s, e, t, spk) in lines:
-        if (_is_orphan(t) and merged
-                and merged[-1][3] == spk
-                and s - merged[-1][1] <= max_gap):
-            ps, _pe, pt, pspk = merged[-1]
-            merged[-1] = (ps, e, _join(pt, t), pspk)
-        else:
-            merged.append((s, e, t, spk))
-
-    # 首行仍是孤兒（無前一行可併）→ 併入下一行
-    if len(merged) >= 2 and _is_orphan(merged[0][2]):
-        s0, _e0, t0, spk0 = merged[0]
-        s1, e1, t1, spk1 = merged[1]
-        if spk0 == spk1 and s1 - merged[0][1] <= max_gap:
-            merged[1] = (s0, e1, _join(t0, t1), spk1)
-            merged.pop(0)
-
-    return merged
+# _merge_orphan_lines 已移至 subtitle_lines（共用）
 
 
 def _ts_to_subtitle_lines(
@@ -456,97 +448,7 @@ def _ts_to_subtitle_lines(
     return _merge_orphan_lines(result)
 
 
-def _ts_chatllm_to_subtitle_lines(
-    ts_items,
-    raw_text: str,
-    chunk_offset: float,
-    spk: str | None,
-    cc,
-    simplified: bool,
-) -> list[tuple[float, float, str, str | None]]:
-    """chatllm ForcedAligner 的字級 (word, start_sec, end_sec) + ASR 原文（含標點）
-    → 字幕行。
-
-    與 _ts_to_subtitle_lines 相同的標點切行邏輯，但 word_list 直接取自
-    chatllm FA 的 JSON 輸出（已與時間軸 1:1 對應），不需 qwen_asr 的
-    aligner_processor，因此純 chatllm（無 torch）即可運作。
-
-    參數：
-        ts_items: list[tuple[str, float, float]]  → (word, start_sec, end_sec)
-    """
-    _all_punct = _ZH_CLAUSE_END | _EN_SENT_END
-    MAX_WORDS    = 8
-    MAX_ZH_CHARS = MAX_CHARS
-    result: list[tuple[float, float, str, str | None]] = []
-
-    if not ts_items or not raw_text.strip():
-        return result
-
-    word_list = [w for (w, _s, _e) in ts_items]
-    n = len(ts_items)
-
-    seg_idx:   list[int] = []   # 當前行的 ts_items 索引
-    seg_words: list[str] = []   # 當前行的原始 word
-    ri = 0                      # raw_text 掃描位置
-
-    def _is_latin_word(w: str) -> bool:
-        return any(c.isascii() and c.isalpha() for c in w)
-
-    def _emit():
-        nonlocal seg_idx, seg_words
-        if not seg_idx:
-            seg_idx = []; seg_words = []
-            return
-        start = chunk_offset + ts_items[seg_idx[0]][1]
-        end   = chunk_offset + ts_items[seg_idx[-1]][2]
-        if any(_is_latin_word(w) for w in seg_words):
-            text = " ".join(seg_words)
-        else:
-            text = "".join(seg_words)
-        if not simplified and cc is not None:
-            text = cc.convert(text)
-        if end > start and text.strip():
-            result.append((start, end, text.strip(), spk))
-        seg_idx = []; seg_words = []
-
-    def _over_limit() -> bool:
-        if any(_is_latin_word(w) for w in seg_words):
-            return len(seg_words) > MAX_WORDS
-        return sum(len(w) for w in seg_words) > MAX_ZH_CHARS
-
-    for wi in range(n):
-        word = word_list[wi]
-
-        # 在 raw_text 中前進到 word 位置；遇到標點 → 先切行
-        hit_punct = False
-        while ri < len(raw_text):
-            c = raw_text[ri]
-            if c in _all_punct:
-                hit_punct = True; ri += 1; continue
-            if c == " ":
-                ri += 1; continue
-            break
-
-        if hit_punct:
-            _emit()
-
-        seg_idx.append(wi)
-        seg_words.append(word)
-
-        # 跳過 word 在 raw_text 中佔用的字元（依長度計數，忽略標點/空格）
-        consumed = 0
-        word_len = len(word)
-        while ri < len(raw_text) and consumed < word_len:
-            c = raw_text[ri]
-            if c in _all_punct or c == " ":
-                ri += 1; continue
-            ri += 1; consumed += 1
-
-        if _over_limit():
-            _emit()
-
-    _emit()
-    return _merge_orphan_lines(result)
+# _ts_chatllm_to_subtitle_lines 已移至 subtitle_lines（共用，全引擎統一）
 
 
 def _rebuild_text_with_spaces(raw_chars: list[str]) -> str:
@@ -808,12 +710,14 @@ class ASREngine:
         diarize: bool = False,
         n_speakers: int | None = None,
         original_path: Path | None = None,
+        out_format: str | None = None,
     ) -> Path | None:
-        """音檔 → SRT，回傳 SRT 路徑。
+        """音檔 → 字幕檔，回傳輸出路徑（.srt 或 .txt）。
         language   : 強制語系（如 "Chinese"），None 表示自動偵測
         context    : 辨識提示（歌詞/關鍵字），放入 system message
         diarize    : True 時用說話者分離取代 VAD，SRT 加說話者前綴
         n_speakers : 指定說話者人數（None=自動偵測）
+        out_format : "srt" | "txt"；None 採全域設定（端點固定傳 "srt"）
         """
         from audio_io import load_audio_16k_mono
         audio, _ = load_audio_16k_mono(audio_path, SAMPLE_RATE)
@@ -932,16 +836,12 @@ class ASREngine:
             return None
 
         if progress_cb:
-            progress_cb(total, total, "寫入 SRT…")
+            progress_cb(total, total, "寫入字幕…")
 
         # 以原始檔案的目錄與檔名輸出（影片抽音軌時 audio_path 是暫存路徑）
+        # 共用寫出層：依全域設定（或 out_format 覆寫）產出 .srt 或 .txt。
         ref = original_path if original_path is not None else audio_path
-        out = ref.parent / (ref.stem + ".srt")
-        with open(out, "w", encoding="utf-8") as f:
-            for idx, (s, e, line, spk) in enumerate(all_subs, 1):
-                prefix = f"{spk}：" if spk else ""
-                f.write(f"{idx}\n{_srt_ts(s)} --> {_srt_ts(e)}\n{prefix}{line}\n\n")
-        return out
+        return write_transcript(ref, all_subs, out_format)
 
 
 # ══════════════════════════════════════════════════════
@@ -1137,6 +1037,10 @@ class App(ctk.CTk):
         self.minsize(800, 580)
 
         self.engine       = ASREngine()
+        # 本行程「已實際載入」的 backend（Vulkan 核心 chatllm/crispasr 的 GPU
+        # context 不會在切換時釋放 → 兩者並存會觸發驅動 TDR 整機重啟，故跨 Vulkan
+        # 核心切換一律擋下、要求重啟。None=尚未載入任何模型。
+        self._loaded_backend: str | None = None
         self._rt_mgr: RealtimeManager | None = None
         self._rt_log: list[str]              = []
         self._rt_autosave_path: Path | None  = None   # 即時追加保存目標 .txt
@@ -1532,13 +1436,12 @@ class App(ctk.CTk):
                 self.engine.use_aligner = False
             return
 
-        # 開啟：已就緒 → 直接啟用
-        if getattr(self.engine, 'use_aligner', False) and \
-           getattr(self.engine, '_fa_bin', None):
+        # 開啟：模型已就緒（_fa_bin 真值）→ 直接啟用（含重新勾選的情況）
+        if getattr(self.engine, '_fa_bin', None):
             self.engine.use_aligner = True
             return
 
-        # FA 尚未就緒：先取消勾選，背景檢查 .bin → 缺少則引導下載（約 939 MB）
+        # FA 尚未就緒：先取消勾選，背景檢查模型 → 缺少則引導下載
         self._align_var.set(False)
         threading.Thread(target=self._check_aligner_model, daemon=True).start()
 
@@ -1552,7 +1455,14 @@ class App(ctk.CTk):
         return self._model_dir
 
     def _check_aligner_model(self):
-        """背景執行緒：FA .bin 在 → 重載 aligner；不在 → 詢問下載。"""
+        """背景執行緒：FA 模型在 → 重載 aligner；不在 → 詢問下載。
+
+        crispasr（Whisper 核心）走 qwen3 ForcedAligner GGUF；其餘後端走 chatllm .bin。
+        """
+        backend = (self._settings or {}).get("backend", "openvino")
+        if backend == "crispasr":
+            self._check_aligner_gguf()
+            return
         from downloader import quick_check_aligner
         fa_dir = self._aligner_dir()
         if fa_dir is None:
@@ -1561,6 +1471,51 @@ class App(ctk.CTk):
             self.after(0, self._reload_aligner)
         else:
             self.after(0, lambda: self._ask_download_aligner(fa_dir))
+
+    def _check_aligner_gguf(self):
+        """背景執行緒（crispasr）：FA gguf 在 → 啟用；不在 → 詢問下載。"""
+        from downloader import (quick_check_aligner_gguf, download_aligner_gguf,
+                                aligner_gguf_filename)
+        crispasr_dir = Path((self._settings or {}).get(
+            "crispasr_dir", str(BASE_DIR / "crispasr")))
+        fa_quant = (self._settings or {}).get("crisp_fa_quant", "q5")
+
+        def _enable():
+            path = crispasr_dir / aligner_gguf_filename(fa_quant)
+            self.engine._aligner_path = path
+            self.engine._fa_bin       = path
+            self.engine.use_aligner   = True
+            self.after(0, self._sync_align_checkbox)
+
+        if quick_check_aligner_gguf(crispasr_dir, fa_quant):
+            _enable()
+            return
+
+        def _ask():
+            if not messagebox.askyesno(
+                "時間軸對齊器",
+                f"「時間軸對齊」需要 qwen3 ForcedAligner 模型（{fa_quant.upper()}，"
+                "約 643 MB）。\n\n是否立即下載？",
+            ):
+                return
+
+            def _dl():
+                self.after(0, self._show_dl_bar)
+                try:
+                    download_aligner_gguf(crispasr_dir, fa_quant,
+                                          progress_cb=self._on_dl_progress)
+                except Exception as e:
+                    msg = str(e)
+                    self.after(0, self._hide_dl_bar)
+                    self.after(0, lambda: messagebox.showerror(
+                        "下載失敗", f"對齊器下載失敗：\n{msg}\n\n請確認網路後重試。"))
+                    return
+                self.after(0, self._hide_dl_bar)
+                _enable()
+
+            threading.Thread(target=_dl, daemon=True).start()
+
+        self.after(0, _ask)
 
     def _ask_download_aligner(self, fa_dir: Path):
         """主執行緒：詢問是否下載 chatllm ForcedAligner 模型（約 939 MB）。"""
@@ -1679,30 +1634,26 @@ class App(ctk.CTk):
             target.delete(0, "end")
             target.insert(0, text)
 
+    def _sync_core_model_ui(self, settings: dict):
+        """主執行緒：依 settings 同步「核心 + 模型」下拉（預設開放，恆常可選）。"""
+        core, label = _ui_core_model(settings)
+        if hasattr(self, "_model_tab"):
+            self._model_tab.set_core(core)   # 刷新該核心的模型清單
+        try:
+            self.model_combo.configure(state="readonly")
+            self.model_var.set(label)
+        except Exception:
+            pass
+
     def _refresh_model_combo(self, model_dir: Path):
-        """主執行緒：動態顯示模型選項。"""
-        available = ["Qwen3-ASR-0.6B", "Qwen3-ASR-1.7B INT8"]
-        self.model_combo.configure(values=available)
-        if self.model_var.get() not in available:
-            self.model_var.set(available[0])
+        """主執行緒：動態顯示模型選項（沿用目前核心）。"""
+        core = self.core_var.get() if hasattr(self, "core_var") else "Qwen"
+        if hasattr(self, "_model_tab"):
+            self._model_tab.set_core(core)
 
     def _refresh_model_combo_from_settings(self, settings: dict):
-        """主執行緒：依 settings.backend 顯示對應的模型 combo 狀態。"""
-        backend = settings.get("backend", "openvino")
-        if backend == "chatllm":
-            self.model_combo.configure(
-                values=["1.7B Q8_0 (Vulkan GPU)"], state="disabled"
-            )
-            self.model_var.set("1.7B Q8_0 (Vulkan GPU)")
-        else:
-            sz = settings.get("cpu_model_size", "0.6B")
-            self.model_combo.configure(
-                values=["Qwen3-ASR-0.6B", "Qwen3-ASR-1.7B INT8"], state="readonly"
-            )
-            if "1.7B" in sz:
-                self.model_var.set("Qwen3-ASR-1.7B INT8")
-            else:
-                self.model_var.set("Qwen3-ASR-0.6B")
+        """主執行緒：依 settings 同步核心+模型下拉。"""
+        self._sync_core_model_ui(settings)
 
     def _detect_all_devices(self):
         """同時偵測 OpenVINO（CPU / Intel iGPU）與 Vulkan（NVIDIA / AMD）裝置。
@@ -1804,6 +1755,8 @@ class App(ctk.CTk):
         vad = settings.get("vad_threshold")
         if vad is not None:
             VAD_THRESHOLD = float(vad)
+        # 全域輸出格式（SRT / 純文字）→ 同步至共用寫出層
+        _subs.OUTPUT_FORMAT = (settings.get("output_format", "srt") or "srt").lower()
         if hasattr(self, "_settings_tab"):
             self._settings_tab.sync_prefs(settings)
         if hasattr(self, "_model_tab"):
@@ -1839,6 +1792,17 @@ class App(ctk.CTk):
             import chatllm_engine as _ce
             _ce._vocab_convert = _g_vocab_convert
 
+    def _on_output_format_change(self, fmt: str):
+        """全域輸出格式切換（"srt" | "txt"）。
+
+        影響批次轉換、單檔轉換、錄製轉換與 API 端點：寫出層 subtitle_lines.
+        write_transcript 讀此全域旗標決定產 .srt 或 .txt。端點另以此設定其預設
+        response_format 與上傳網頁預設選項。
+        """
+        fmt = "txt" if str(fmt).lower() == "txt" else "srt"
+        _subs.OUTPUT_FORMAT = fmt
+        self._patch_setting("output_format", fmt)
+
     def _on_ui_scale_change(self, scale: float):
         """介面縮放：等比放大／縮小所有元件與字體（高 DPI 螢幕適用）。"""
         try:
@@ -1866,6 +1830,17 @@ class App(ctk.CTk):
             mdl  = s.get("model_path", "") or s.get("gguf_path", "")
             cdir = s.get("chatllm_dir", "")
             return bool(mdl and cdir and Path(mdl).exists() and Path(cdir).exists())
+        elif backend == "crispasr":
+            # crispasr.exe（核心）+ Breeze 模型皆就緒才算有效；否則進 onboarding。
+            # 缺此分支會讓 backend=crispasr 永遠判為無效 → 切到 Whisper 後重啟卻又
+            # 跳回引導畫面（與舊版守衛不持久化合併造成「切不過去」的無限循環）。
+            try:
+                from downloader import quick_check_crispasr, quick_check_breeze
+                cdir  = Path(s.get("crispasr_dir", str(BASE_DIR / "crispasr")))
+                quant = s.get("crisp_quant", "q5")
+                return quick_check_crispasr(cdir) and quick_check_breeze(cdir, quant)
+            except Exception:
+                return False
         elif backend == "openvino":
             model_dir = s.get("model_dir", "")
             if not model_dir:
@@ -2330,6 +2305,19 @@ class App(ctk.CTk):
     def _hide_dl_bar(self):
         self.dl_bar.pack_forget()
 
+    def _ask_yesno_sync(self, title: str, msg: str) -> bool:
+        """從背景執行緒安全地彈出 askyesno（在主執行緒顯示並等待回應）。"""
+        ev = threading.Event()
+        box = {"ans": False}
+
+        def _ask():
+            box["ans"] = messagebox.askyesno(title, msg)
+            ev.set()
+
+        self.after(0, _ask)
+        ev.wait()
+        return box["ans"]
+
     def _load_models(self):
         import gc
 
@@ -2346,6 +2334,11 @@ class App(ctk.CTk):
         device_label   = settings.get("device", self.device_var.get())
         # 解析 OV 裝置名（如 "GPU.0 (Intel...)" → "GPU.0"）
         ov_device      = device_label.split(" (")[0].split(" [")[0]
+        # 防呆：模型驅動 backend 後，若選到 Vulkan 裝置(GPU:N)卻走 OpenVINO，
+        # 該名稱對 OV 無效 → 退回 CPU（Vulkan 裝置僅供 chatllm / crispasr 使用）。
+        if "Vulkan" in device_label or ov_device.startswith("GPU:"):
+            if backend == "openvino":
+                ov_device = "CPU"
 
         if backend == "chatllm":
             # ── chatllm / Vulkan 路線 ──────────────────────────────────
@@ -2442,6 +2435,128 @@ class App(ctk.CTk):
                 first_line = str(e).splitlines()[0][:120]
                 self.after(0, lambda r=first_line: self._on_models_failed("chatllm", r))
 
+        elif backend == "crispasr":
+            # ── CrispASR(Whisper/Breeze) / Vulkan 路線 ──────────────────
+            if not _CRISPASR_AVAILABLE:
+                self.after(0, lambda: self._on_models_failed(
+                    "crispasr", "crisp_engine 無法載入，請確認 crisp_engine.py"
+                ))
+                return
+            from downloader import (quick_check_crispasr, download_crispasr_core,
+                                    quick_check_breeze, download_breeze, breeze_filename,
+                                    quick_check_aligner_gguf, download_aligner_gguf,
+                                    aligner_gguf_filename)
+
+            crispasr_dir = Path(settings.get("crispasr_dir", str(BASE_DIR / "crispasr")))
+            quant        = settings.get("crisp_quant", "q5")
+            model_path   = crispasr_dir / breeze_filename(quant)
+            # FA 對齊器（預設開）：缺檔才引導下載；使用者婉拒則退回 whisper native
+            fa_enabled   = bool(settings.get("crisp_fa", True))
+            fa_quant     = settings.get("crisp_fa_quant", "q5")
+
+            def _abort(reason: str):
+                self.after(0, self._hide_dl_bar)
+                self.after(0, lambda: self.reload_btn.configure(state="normal"))
+                self.after(0, lambda r=reason: self._set_status(r))
+
+            # ① 檢查並取得核心（無 → 確認後下載解壓）
+            if not quick_check_crispasr(crispasr_dir):
+                if not self._ask_yesno_sync(
+                    "下載 CrispASR 核心",
+                    "Whisper 核心（CrispASR Vulkan，約 27 MB）尚未安裝。\n"
+                    "首次使用需下載並解壓，是否立即下載？",
+                ):
+                    _abort("已取消（缺少 CrispASR 核心）")
+                    return
+                self.after(0, self._show_dl_bar)
+                try:
+                    download_crispasr_core(crispasr_dir, progress_cb=self._on_dl_progress)
+                except Exception as e:
+                    msg = str(e)
+                    self.after(0, self._hide_dl_bar)
+                    self.after(0, lambda: self.reload_btn.configure(state="normal"))
+                    self.after(0, lambda m=msg: messagebox.showerror(
+                        "下載失敗", f"CrispASR 核心下載失敗：\n{m}\n\n請確認網路後重試。"))
+                    self.after(0, lambda: self._set_status("❌ 核心下載失敗"))
+                    return
+                self.after(0, self._hide_dl_bar)
+
+            # ② 檢查並取得模型（無 → 確認後下載）
+            if not quick_check_breeze(crispasr_dir, quant):
+                size_hint = {"q4": "約 889 MB", "q5": "約 1.08 GB",
+                             "q8": "約 1.66 GB"}.get(quant, "")
+                if not self._ask_yesno_sync(
+                    "下載 Whisper 模型",
+                    f"Breeze-ASR-26 {quant.upper()} 模型（{size_hint}）尚未下載。\n"
+                    "是否立即下載？",
+                ):
+                    _abort("已取消（缺少 Whisper 模型）")
+                    return
+                self.after(0, self._show_dl_bar)
+                try:
+                    download_breeze(crispasr_dir, quant, progress_cb=self._on_dl_progress)
+                except Exception as e:
+                    msg = str(e)
+                    self.after(0, self._hide_dl_bar)
+                    self.after(0, lambda: self.reload_btn.configure(state="normal"))
+                    self.after(0, lambda m=msg: messagebox.showerror(
+                        "下載失敗", f"Whisper 模型下載失敗：\n{m}\n\n請確認網路後重試。"))
+                    self.after(0, lambda: self._set_status("❌ 模型下載失敗"))
+                    return
+                self.after(0, self._hide_dl_bar)
+
+            # ②.5 時間軸對齊器（預設開）：缺 gguf → 確認後下載（婉拒則退回 native）
+            aligner_path = None
+            if fa_enabled:
+                if quick_check_aligner_gguf(crispasr_dir, fa_quant):
+                    aligner_path = crispasr_dir / aligner_gguf_filename(fa_quant)
+                elif self._ask_yesno_sync(
+                    "下載時間軸對齊器",
+                    f"Whisper 自帶時間軸較粗。時間軸對齊器（qwen3 ForcedAligner "
+                    f"{fa_quant.upper()}，約 643 MB）可產生精確字級時間軸。\n\n"
+                    "是否立即下載？（婉拒則使用 Whisper 自帶時間軸）",
+                ):
+                    self.after(0, self._show_dl_bar)
+                    try:
+                        download_aligner_gguf(crispasr_dir, fa_quant,
+                                              progress_cb=self._on_dl_progress)
+                        aligner_path = crispasr_dir / aligner_gguf_filename(fa_quant)
+                    except Exception as e:
+                        msg = str(e)
+                        self.after(0, self._hide_dl_bar)
+                        self.after(0, lambda m=msg: messagebox.showwarning(
+                            "下載失敗",
+                            f"對齊器下載失敗：\n{m}\n\n將先使用 Whisper 自帶時間軸。"))
+                        aligner_path = None
+                    self.after(0, self._hide_dl_bar)
+
+            # ③ 持久化設定 + 載入引擎（核心與模型皆就緒，不重複下載）
+            settings["crispasr_dir"] = str(crispasr_dir)
+            settings["crisp_quant"]  = quant
+            settings["crisp_fa"]     = fa_enabled
+            settings["crisp_fa_quant"] = fa_quant
+            self._settings = settings
+            self._save_settings(settings)
+
+            _vk_dev_id = 0
+            _m = re.search(r"GPU:(\d+)", device_label)
+            if _m:
+                _vk_dev_id = int(_m.group(1))
+            self._model_dir = Path(settings.get("model_dir", str(BASE_DIR / "ov_models")))
+            self.engine = CrispWhisperEngine()
+            try:
+                self.engine.load(
+                    model_path   = model_path,
+                    crispasr_dir = crispasr_dir,
+                    device_id    = _vk_dev_id,
+                    cb           = self._set_status,
+                    aligner_path = aligner_path,
+                )
+                self.after(0, self._on_models_ready)
+            except Exception as e:
+                first_line = str(e).splitlines()[0][:120]
+                self.after(0, lambda r=first_line: self._on_models_failed("crispasr", r))
+
         else:
             # ── OpenVINO 路線 ──────────────────────────────────────────
             model_dir  = Path(settings.get("model_dir", str(_DEFAULT_MODEL_DIR)))
@@ -2496,23 +2611,12 @@ class App(ctk.CTk):
         settings = self._settings or {}
         backend  = settings.get("backend", "openvino")
         device   = self.device_var.get()
+        # 記錄本行程實際載入的 backend（供跨 Vulkan 核心切換守衛判斷）
+        self._loaded_backend = backend
 
-        # ── model_combo 依後端顯示 ─────────────────────────────────────
-        if backend == "chatllm":
-            # Vulkan GPU：顯示固定標籤，combo 唯讀
-            self.model_combo.configure(
-                values=["1.7B Q8_0 (Vulkan GPU)"], state="disabled"
-            )
-            self.model_var.set("1.7B Q8_0 (Vulkan GPU)")
-            self._set_status(self._ready_summary(device, backend))
-        else:
-            # OpenVINO：顯示 0.6B / 1.7B INT8
-            self.model_combo.configure(
-                values=["Qwen3-ASR-0.6B", "Qwen3-ASR-1.7B INT8"], state="readonly"
-            )
-            sz = settings.get("cpu_model_size", "0.6B")
-            self.model_var.set("Qwen3-ASR-1.7B INT8" if "1.7B" in sz else "Qwen3-ASR-0.6B")
-            self._set_status(self._ready_summary(device, backend))
+        # ── 核心 + 模型下拉同步（預設開放，恆常可選）─────────────────────
+        self._sync_core_model_ui(settings)
+        self._set_status(self._ready_summary(device, backend))
 
         # 填入語系清單（模型載入後才知道 supported_languages）
         if self.engine.processor and self.engine.processor.supported_languages:
@@ -2520,8 +2624,8 @@ class App(ctk.CTk):
             self._lang_list = self.engine.processor.supported_languages
             self.lang_combo.configure(values=langs, state="readonly")
             self.lang_var.set("自動偵測")
-        elif backend == "chatllm":
-            # chatllm 模型支援所有語系，提供常用語系清單
+        elif backend in ("chatllm", "crispasr"):
+            # chatllm / CrispASR 模型支援多語系，提供常用語系清單
             common_langs = [
                 "Chinese", "English", "Japanese", "Korean",
                 "Cantonese", "French", "German", "Spanish",
@@ -2664,13 +2768,42 @@ class App(ctk.CTk):
         model_sel  = self.model_var.get()
         cur        = dict(self._settings) if self._settings else self._load_settings()
 
-        if "Vulkan" in dev_label:
-            cur["backend"] = "chatllm"
+        # 三層選擇：核心(core) + 模型(model) → backend（裝置維持現狀，僅選 CPU/GPU）
+        core_sel       = self.core_var.get() if hasattr(self, "core_var") else "Qwen"
+        backend, extra = _resolve_backend(core_sel, model_sel)
+
+        # ── 跨 Vulkan 核心切換守衛 ────────────────────────────────────────
+        # chatllm 與 crispasr 各自持有 Vulkan GPU context（chatllm 的 DLL context
+        # 行程結束前不會釋放）。在同一次執行中由其一切到另一，兩個 Vulkan context
+        # 並存 → 觸發顯卡驅動 TDR / 整機重啟。故偵測到跨 Vulkan 核心切換即擋下，
+        # 還原下拉並請使用者重啟程式後再切。
+        _VK = ("chatllm", "crispasr")
+        if (self._loaded_backend in _VK and backend in _VK
+                and backend != self._loaded_backend):
+            # 不能在同一次執行中熱切換（兩個 Vulkan context 並存 → TDR），但「必須把
+            # 新選擇寫入 settings.json」。舊版在此 return 前未持久化、且把下拉還原回舊
+            # 核心，導致重啟後讀回舊 backend → 永遠切不過去（無限循環）。
+            # 修法：先持久化新核心，UI 維持在新選擇，重啟後 _load_settings 自動以新核心載入。
+            cur["backend"] = backend
             cur["device"]  = dev_label
-        else:
-            cur["backend"] = "openvino"
-            cur["device"]  = dev_label
-            cur["cpu_model_size"] = "1.7B" if "1.7B" in model_sel else "0.6B"
+            if backend == "crispasr":
+                cur["crisp_quant"] = extra            # q4 / q5 / q8
+            self._settings = cur
+            self._save_settings(cur)
+            messagebox.showwarning(
+                "需要重新啟動程式",
+                "已記住您選擇的核心。\n\nQwen（Vulkan）與 Whisper（Vulkan）兩種 GPU 核心"
+                "無法在同一次執行中切換——兩者若同時載入，顯示卡驅動會重置並導致整台電腦"
+                "重新開機。\n\n請關閉本程式並重新啟動，啟動後將自動以新核心載入。",
+            )
+            return
+
+        cur["backend"] = backend
+        cur["device"]  = dev_label
+        if backend == "crispasr":
+            cur["crisp_quant"] = extra            # q4 / q5 / q8
+        elif backend == "openvino":
+            cur["cpu_model_size"] = extra         # 0.6B / 1.7B
 
         self._settings = cur
 
@@ -2685,6 +2818,8 @@ class App(ctk.CTk):
         model_label = self.model_var.get()
         if backend == "chatllm":
             core = "GPU 推理（Vulkan）"
+        elif backend == "crispasr":
+            core = "GPU 推理（Vulkan / CrispASR）"
         elif device == "CPU":
             core = "CPU 推理"
         else:
@@ -2743,6 +2878,13 @@ class App(ctk.CTk):
         """開啟字幕驗證編輯視窗。"""
         if not self._srt_output or not self._srt_output.exists():
             messagebox.showwarning("提示", "尚無可驗證的字幕，請先執行轉換。")
+            return
+        # 純文字輸出無時間軸，字幕編輯器僅支援 SRT
+        if self._srt_output.suffix.lower() != ".srt":
+            messagebox.showinfo(
+                "提示",
+                "目前輸出為純文字（.txt），無時間軸可編輯。\n"
+                "若需使用字幕編輯器，請至「設定 → 輸出格式」改回「SRT 字幕」後重新轉換。")
             return
         SubtitleEditorWindow(
             self,
@@ -2985,13 +3127,14 @@ class App(ctk.CTk):
             messagebox.showinfo("提示", "目前沒有字幕內容可儲存")
             return
         ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out = SRT_DIR / f"realtime_{ts}.srt"
-        t   = 0.0
-        with open(out, "w", encoding="utf-8") as f:
-            for idx, line in enumerate(self._rt_log, 1):
-                end = t + 5.0
-                f.write(f"{idx}\n{_srt_ts(t)} --> {_srt_ts(end)}\n{line}\n\n")
-                t = end + 0.1
+        # 合成時間軸（錄製轉換無精確時間戳，每行固定 5s）→ 共用寫出層依全域格式產檔
+        lines: list[tuple[float, float, str, str | None]] = []
+        t = 0.0
+        for line in self._rt_log:
+            end = t + 5.0
+            lines.append((t, end, line, None))
+            t = end + 0.1
+        out = write_transcript(SRT_DIR / f"realtime_{ts}", lines)
         messagebox.showinfo("儲存完成", f"已儲存至：\n{out}")
         os.startfile(str(SRT_DIR))
 

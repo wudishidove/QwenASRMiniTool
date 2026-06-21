@@ -29,6 +29,19 @@ _VIDEO_HINT = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm",
                ".f4v", ".mxf"}
 
 
+def _global_resp_default() -> str:
+    """全域輸出格式 → 端點預設 response_format（srt→"srt"、txt→"text"）。
+
+    使用者在「設定」選的全域純文字/SRT，會成為端點未指定 response_format 時的
+    預設，以及上傳網頁的預設下拉選項。程式化 API 仍可用 response_format 明確覆寫。
+    """
+    try:
+        import subtitle_lines as _subs
+        return "text" if getattr(_subs, "OUTPUT_FORMAT", "srt") == "txt" else "srt"
+    except Exception:
+        return "srt"
+
+
 # ── multipart/form-data 解析（手寫，避開已棄用的 cgi）──────────────────
 def _parse_multipart(body: bytes, boundary: bytes):
     """回傳 (fields: dict[str,str], files: dict[str,(filename, bytes)])。"""
@@ -177,7 +190,17 @@ class TranscribeServer:
                         self._send(401, "text/html; charset=utf-8",
                                    _UNAUTH_HTML.encode("utf-8"))
                         return
-                    self._send(200, "text/html; charset=utf-8", _INDEX_HTML.encode("utf-8"))
+                    # 上傳網頁的格式下拉預設跟隨全域設定（srt / text）
+                    _html = _INDEX_HTML
+                    if _global_resp_default() == "text":
+                        _html = _html.replace(
+                            '<option value="text">純文字</option>',
+                            '<option value="text" selected>純文字</option>')
+                    else:
+                        _html = _html.replace(
+                            '<option value="srt">SRT 字幕</option>',
+                            '<option value="srt" selected>SRT 字幕</option>')
+                    self._send(200, "text/html; charset=utf-8", _html.encode("utf-8"))
                 else:
                     self._send(404, "application/json", b'{"error":"not found"}')
 
@@ -235,7 +258,8 @@ class TranscribeServer:
             return
 
         # 參數
-        resp_fmt = (fields.get("response_format") or "json").lower()
+        # 未指定 response_format 時，採用全域輸出格式設定（srt→"srt"、txt→"text"）。
+        resp_fmt = (fields.get("response_format") or _global_resp_default()).lower()
         language = fields.get("language") or None
         if language in ("", "auto", "自動偵測"):
             language = None
@@ -271,12 +295,15 @@ class TranscribeServer:
             if align is not None and hasattr(eng, "use_aligner") and getattr(eng, "_fa_bin", None):
                 eng.use_aligner = align
 
+            # 端點內部需解析時間軸 → 固定要求引擎產出 SRT，不受全域純文字設定影響；
+            # 純文字/JSON 回應由下方依 resp_fmt 自 SRT 後處理產生。
             srt_path = eng.process_file(
                 audio_path,
                 language=language,
                 diarize=diarize,
                 n_speakers=n_speakers,
                 original_path=original,
+                out_format="srt",
             )
         finally:
             if prev_align is not None and hasattr(eng, "use_aligner"):
