@@ -77,6 +77,7 @@ SAMPLE_RATE          = 16000
 VAD_CHUNK            = 512
 VAD_THRESHOLD        = 0.5
 MAX_GROUP_SEC        = 20
+OFFICIAL_CHUNK_MINUTES_DEFAULT = 5.0
 MAX_CHARS            = 20
 MIN_SUB_SEC          = 0.6
 GAP_SEC              = 0.08
@@ -151,13 +152,14 @@ def _detect_speech_groups(audio: np.ndarray, vad_sess) -> list[tuple[float, floa
     return result
 
 
-def _split_to_lines(text: str) -> list[str]:
+def _split_to_lines(text: str, break_on_space: bool = False) -> list[str]:
     """語意優先斷句（ForcedAligner 不可用時的 fallback）。
 
     斷句規則（英文/中文統一）：
     1. 所有標點（,.!?; 及中文，。？！）→ 立即切行，標點不輸出
     2. 英文整字為最小單位，詞間保留空格
     3. MAX_CHARS 保護：超限才強制換行
+    4. break_on_space=True：空白也當切點（無標點模型適用），但不拆兩個拉丁詞
     """
     if not text:
         return []
@@ -194,8 +196,22 @@ def _split_to_lines(text: str) -> list[str]:
             i = j
             continue
 
-        # ── 空格：只在 buf 有內容且未以空格結尾時記錄 ────────────────
+        # ── 空格 ─────────────────────────────────────────────────────
         if ch == " ":
+            # break_on_space：空白＝切點，但避免拆開兩個拉丁詞
+            if break_on_space:
+                prev = buf[-1] if buf else ""
+                nxt  = text[i + 1] if i + 1 < len(text) else ""
+                between_latin = (
+                    prev.isascii() and prev.isalpha()
+                    and nxt.isascii() and nxt.isalpha()
+                )
+                if buf.strip() and not between_latin:
+                    lines.append(buf.strip())
+                    buf = ""
+                    i += 1
+                    continue
+            # 否則：只在 buf 有內容且未以空格結尾時記錄空格
             if buf and not buf.endswith(" "):
                 buf += " "
             i += 1
@@ -265,6 +281,7 @@ def _ts_to_subtitle_lines(
     simplified: bool,
     aligner_processor=None,
     language: str | None = None,
+    break_on_space: bool = False,
 ) -> list[tuple[float, float, str, str | None]]:
     """ForcedAligner token（詞級別）+ ASR 原文（含標點）→ 字幕行。
 
@@ -273,8 +290,6 @@ def _ts_to_subtitle_lines(
     原始位置，以標點觸發切行。
     """
     _all_punct = _ZH_CLAUSE_END | _EN_SENT_END
-    MAX_WORDS    = 8
-    MAX_ZH_CHARS = MAX_CHARS
     result: list[tuple[float, float, str, str | None]] = []
 
     if not ts_list or not raw_text.strip():
@@ -322,81 +337,117 @@ def _ts_to_subtitle_lines(
     # 取 min 以防長度不一致（防禦性）
     n = min(len(word_list), len(ts_list))
 
-    # ── 2. 為每個 word 在 raw_text 中找到對應位置 ────────────────────
-    #    並記錄「在這個 word 之前有哪些標點」→ 用於切行
-    seg_tokens: list = []      # 當前行的 FA token
-    seg_words: list[str] = []  # 當前行的原始 word
-    ri = 0                     # raw_text 掃描位置
-
-    def _is_latin_word(w: str) -> bool:
-        return any(c.isascii() and c.isalpha() for c in w)
-
-    def _emit():
-        nonlocal seg_tokens, seg_words
-        if not seg_tokens:
-            seg_tokens = []
-            seg_words  = []
-            return
-        start = chunk_offset + seg_tokens[0].start_time
-        end   = chunk_offset + seg_tokens[-1].end_time
-        # 重建文字：有拉丁詞用空格 join，純中文直接 join
-        if any(_is_latin_word(w) for w in seg_words):
-            text = " ".join(seg_words)
-        else:
-            text = "".join(seg_words)
-        if not simplified and cc is not None:
-            text = cc.convert(text)
-        if end > start and text.strip():
-            result.append((start, end, text.strip(), spk))
-        seg_tokens = []
-        seg_words  = []
-
-    def _over_limit() -> bool:
-        if any(_is_latin_word(w) for w in seg_words):
-            return len(seg_words) > MAX_WORDS
-        return sum(len(w) for w in seg_words) > MAX_ZH_CHARS
-
+    # ── 2. 把 FA 每個 word 的時間，依字元穩健對位鋪到 raw_text 的字元上 ──
+    #    舊版用 word_list 重建文字 + ri 等長消耗：遇到 tokenizer 丟棄的符號
+    #    （如「%」）會與 raw_text 失步 → 逗號掛錯詞、且輸出掉字。改為以 raw_text
+    #    為準切行，FA 時間只用來標記每行的起訖。
+    char_time: list = [None] * len(raw_text)
+    ri = 0
     for wi in range(n):
         word = word_list[wi]
-        tok  = ts_list[wi]     # ForcedAlignItem: .text, .start_time, .end_time
+        tok  = ts_list[wi]     # ForcedAlignItem: .start_time, .end_time
+        st = float(tok.start_time); et = float(tok.end_time)
+        dur = et - st if et > st else 0.0
+        positions = []
+        for wc in word:
+            while ri < len(raw_text) and raw_text[ri] != wc:
+                ri += 1   # 跳過 raw_text 中對不上的字元（標點/空白/% 等）
+            if ri < len(raw_text):
+                positions.append(ri); ri += 1
+        m = len(positions)
+        for k, pos in enumerate(positions):
+            char_time[pos] = (
+                (st + dur * (k / m), st + dur * ((k + 1) / m)) if m else (st, et)
+            )
 
-        # 在 raw_text 中前進到 word 的位置（跳過標點和空格）
-        # 遇到標點 → 切行
-        hit_punct = False
-        while ri < len(raw_text):
-            c = raw_text[ri]
-            if c in _all_punct:
-                hit_punct = True
-                ri += 1
-                continue
-            if c == " ":
-                ri += 1
-                continue
-            break  # 到達下一個有效字元
+    # forward / backward fill：tokenizer 丟棄處（含標點）也補上時間，確保每行可定時
+    _last = None
+    for _i in range(len(char_time)):
+        if char_time[_i] is not None:
+            _last = char_time[_i]
+        elif _last is not None:
+            char_time[_i] = (_last[1], _last[1])
+    _nxt = None
+    for _i in range(len(char_time) - 1, -1, -1):
+        if char_time[_i] is not None:
+            _nxt = char_time[_i]
+        elif _nxt is not None:
+            char_time[_i] = (_nxt[0], _nxt[0])
 
-        if hit_punct:
-            _emit()  # 標點前的內容先輸出
+    # ── 3. 依 raw_text 切行（規則同 _split_to_lines），時間取自 char_time ──
+    cur: list = []   # 當前行：list[(char, time|None)]
 
-        seg_tokens.append(tok)
-        seg_words.append(word)
+    def _cur_str() -> str:
+        return "".join(c for c, _t in cur)
 
-        # 在 raw_text 中跳過 word 佔用的字元
-        consumed = 0
-        word_len = len(word)
-        while ri < len(raw_text) and consumed < word_len:
-            c = raw_text[ri]
-            if c in _all_punct or c == " ":
-                ri += 1
-                continue
-            ri += 1
-            consumed += 1
+    def _emit():
+        nonlocal cur
+        chars = cur; cur = []
+        s = "".join(c for c, _t in chars).strip()
+        if not s:
+            return
+        if not simplified and cc is not None:
+            s = cc.convert(s)
+        times = [t for _c, t in chars if t is not None]
+        if not times:
+            return
+        start = chunk_offset + min(t[0] for t in times)
+        end   = chunk_offset + max(t[1] for t in times)
+        if end <= start:
+            end = start + MIN_SUB_SEC
+        result.append((start, end, s, spk))
 
-        # MAX_CHARS / MAX_WORDS 保護
-        if _over_limit():
+    i = 0
+    L = len(raw_text)
+    while i < L:
+        ch = raw_text[i]
+        # 標點 → 切行（標點不輸出）
+        if ch in _all_punct:
+            _emit(); i += 1; continue
+        # 英文整字：詞前補分詞空格，MAX_CHARS 保護
+        if ch.isalpha() and ord(ch) < 128:
+            j = i
+            while j < L and raw_text[j].isalpha() and ord(raw_text[j]) < 128:
+                j += 1
+            s = _cur_str()
+            prefix = bool(s and not s.endswith(" "))
+            if len(s) + (1 if prefix else 0) + (j - i) > MAX_CHARS and s.strip():
+                _emit()
+            elif prefix:
+                cur.append((" ", None))
+            for k in range(i, j):
+                cur.append((raw_text[k], char_time[k]))
+            i = j; continue
+        # 空格
+        if ch == " ":
+            s = _cur_str()
+            if break_on_space:
+                prev = s[-1] if s else ""
+                nxt  = raw_text[i + 1] if i + 1 < L else ""
+                between_latin = (prev.isascii() and prev.isalpha()
+                                 and nxt.isascii() and nxt.isalpha())
+                if s.strip() and not between_latin:
+                    _emit(); i += 1; continue
+            if s and not s.endswith(" "):
+                cur.append((" ", None))
+            i += 1
+            if len(_cur_str().rstrip()) >= MAX_CHARS:
+                _emit()
+            continue
+        # 中文 / 數字 / 其他符號（含「%」）：逐字累積
+        cur.append((ch, char_time[i]))
+        i += 1
+        if len(_cur_str()) >= MAX_CHARS:
             _emit()
 
-    # ── 3. 清空剩餘 ──────────────────────────────────────────────────
+    # ── 4. 清空剩餘 ──────────────────────────────────────────────────
     _emit()
+    # 合併過短的單字孤兒行（break_on_space 對逐字吐空白的異常區段尤其需要）
+    try:
+        from subtitle_lines import _merge_orphan_lines
+        result = _merge_orphan_lines(result)
+    except Exception:
+        pass
     return result
 
 
@@ -420,9 +471,112 @@ _g_output_simplified: bool = False
 # 全域：繁體輸出時是否啟用「簡繁詞彙轉換」（s2twp=開 / s2t=關）
 _g_vocab_convert: bool = True
 
+# 全域：OpenCC 繁化開關（False = 輸出模型原文「逐字」，不做任何簡繁轉換）。
+# 微調模型（pkm-ft）原生輸出繁體，OpenCC 反而會破壞專名 → 切到微調模型時預設關。
+_g_opencc_enabled: bool = True
+
+# 全域：字幕「空白也斷句」開關（沿用 Whisper 路徑的 break_on_space）。
+# 微調模型（pkm-ft）輸出幾乎無標點、改用空白標記語句邊界 → 開啟後在空白處斷行，
+# 恢復自然斷句（否則只能每 MAX_CHARS 硬切）。切到微調模型時預設開。
+_g_break_on_space: bool = True
+
 
 def _opencc_config() -> str:
     return "s2twp" if _g_vocab_convert else "s2t"
+
+
+# ── GPU 模型選擇（DEPLOY-1）───────────────────────────────────────────
+_PREFERRED_GPU_MODEL = "pkm-ft-1.7b-v2"
+
+
+def _scan_gpu_models() -> list[str]:
+    """掃描 GPUModel/ 下可用的 Qwen3-ASR 模型。
+
+    條件：子目錄含 config.json 且 model_type=qwen3_asr；排除 ForcedAligner
+    （aligner 的 config 同樣是 qwen3_asr，故以目錄名過濾）。
+    """
+    found: list[str] = []
+    try:
+        for d in sorted(GPU_MODEL_DIR.iterdir()):
+            if not d.is_dir() or "aligner" in d.name.lower():
+                continue
+            cfg = d / "config.json"
+            if not cfg.exists():
+                continue
+            try:
+                mt = json.loads(cfg.read_text(encoding="utf-8")).get("model_type", "")
+            except Exception:
+                mt = ""
+            if mt == "qwen3_asr":
+                found.append(d.name)
+    except Exception:
+        pass
+    return found
+
+
+def _default_gpu_model(models: list[str]) -> str:
+    """挑選預設 GPU 模型：優先微調版 pkm-ft-1.7b-v1，其次原始 1.7B，再次第一個。"""
+    if _PREFERRED_GPU_MODEL in models:
+        return _PREFERRED_GPU_MODEL
+    if ASR_MODEL_NAME in models:
+        return ASR_MODEL_NAME
+    return models[0] if models else ASR_MODEL_NAME
+
+
+def _model_outputs_traditional(name: str) -> bool:
+    """微調模型原生輸出繁體（不需 OpenCC）；原始 Qwen3-ASR 基座輸出簡體（需轉繁）。
+
+    啟發式：非 'Qwen3-ASR' 開頭者視為微調 / 原生繁體模型。
+    """
+    return not (name or "").lower().startswith("qwen3-asr")
+
+
+# 早期無標點微調（靠空白標記語句邊界）→ break_on_space 預設開。
+# v2 起的微調已在訓練資料 cue 邊界補回逗號、原生輸出標點 → 與基座一樣靠標點斷句。
+_PUNCTLESS_GPU_MODELS = {"pkm-ft-1.7b-v1", "pkm-ft-v0"}
+
+
+def _model_has_punct(name: str) -> bool:
+    """模型輸出是否帶語句邊界標點。原始基座與 v2 起的微調都帶標點 →
+    break_on_space 預設關（靠標點斷句）；早期無標點微調（v0/v1）→ 預設開（靠空白）。"""
+    return (name or "") not in _PUNCTLESS_GPU_MODELS
+
+
+def _normalize_segment_mode(value: str | None) -> str:
+    mode = (value or "vad").strip().lower()
+    return mode if mode in {"vad", "official"} else "vad"
+
+
+def _fmt_minutes(value: float) -> str:
+    return f"{value:g}"
+
+
+def _official_split_groups(
+    audio: np.ndarray,
+    base_offset: float,
+    spk: str | None,
+    max_chunk_sec: float,
+) -> list[tuple[float, float, np.ndarray, str | None]]:
+    """Use qwen-asr's official low-energy splitter and preserve global offsets."""
+    from qwen_asr.inference.utils import split_audio_into_chunks
+
+    max_chunk_sec = max(1.0, float(max_chunk_sec))
+    total_sec = len(audio) / SAMPLE_RATE
+    groups: list[tuple[float, float, np.ndarray, str | None]] = []
+    for chunk, offset_sec in split_audio_into_chunks(
+        wav=audio,
+        sr=SAMPLE_RATE,
+        max_chunk_sec=max_chunk_sec,
+    ):
+        start = base_offset + float(offset_sec)
+        end = base_offset + min(
+            float(offset_sec) + len(chunk) / SAMPLE_RATE,
+            total_sec,
+        )
+        if len(chunk) == 0:
+            continue
+        groups.append((start, max(start, end), chunk.astype(np.float32, copy=False), spk))
+    return groups
 
 # ══════════════════════════════════════════════════════
 # GPU ASR 引擎
@@ -441,6 +595,10 @@ class GPUASREngine:
         self.device      = "cpu"
         self.cc          = None
         self.diar_engine = None
+        self.segment_mode = _normalize_segment_mode(
+            os.environ.get("QWEN_GPU_SEGMENT_MODE")
+        )
+        self.official_chunk_sec = OFFICIAL_CHUNK_MINUTES_DEFAULT * 60.0
 
     def load(self, device: str = "cuda", model_dir: Path = None,
              cb=None, use_aligner: bool = True):
@@ -538,6 +696,16 @@ class GPUASREngine:
         except Exception:
             pass
 
+    def _should_opencc(self) -> bool:
+        """是否要對輸出套用 OpenCC 繁化：OpenCC 開關開、且非簡體輸出模式。"""
+        return _g_opencc_enabled and not _g_output_simplified
+
+    def _convert_out(self, text: str) -> str:
+        """依 OpenCC 開關決定輸出：關閉時直接回傳模型原文（逐字）。"""
+        if self._should_opencc() and self.cc is not None:
+            return self.cc.convert(text)
+        return text
+
     def transcribe(
         self,
         audio: np.ndarray,
@@ -553,7 +721,7 @@ class GPUASREngine:
                 context=context or "",
             )
             text = (results[0].text if results else "").strip()
-            return text if _g_output_simplified else self.cc.convert(text)
+            return self._convert_out(text)
 
     def process_file(
         self,
@@ -574,20 +742,34 @@ class GPUASREngine:
             diar_segs = self.diar_engine.diarize(audio, n_speakers=n_speakers)
             if not diar_segs:
                 return None
-            groups_spk = [
-                (t0, t1,
-                 audio[int(t0 * SAMPLE_RATE): int(t1 * SAMPLE_RATE)],
-                 spk)
-                for t0, t1, spk in diar_segs
-            ]
+            groups_spk = []
+            for t0, t1, spk in diar_segs:
+                chunk = audio[int(t0 * SAMPLE_RATE): int(t1 * SAMPLE_RATE)]
+                if self.segment_mode == "official":
+                    groups_spk.extend(_official_split_groups(
+                        chunk, t0, spk, self.official_chunk_sec
+                    ))
+                else:
+                    groups_spk.append((t0, t1, chunk, spk))
         else:
-            vad_groups = _detect_speech_groups(audio, self.vad_sess)
-            if not vad_groups:
-                return None
-            groups_spk = [(g0, g1, chunk, None) for g0, g1, chunk in vad_groups]
+            if self.segment_mode == "official":
+                groups_spk = _official_split_groups(
+                    audio, 0.0, None, self.official_chunk_sec
+                )
+            else:
+                vad_groups = _detect_speech_groups(audio, self.vad_sess)
+                if not vad_groups:
+                    return None
+                groups_spk = [(g0, g1, chunk, None) for g0, g1, chunk in vad_groups]
 
         all_subs: list[tuple[float, float, str, str | None]] = []
         total = len(groups_spk)
+        if self.segment_mode == "official" and progress_cb:
+            progress_cb(
+                0,
+                max(1, total),
+                f"官方切片：{total} 段（目標 {_fmt_minutes(self.official_chunk_sec / 60.0)} 分鐘）",
+            )
         for i, (g0, g1, chunk, spk) in enumerate(groups_spk):
             if progress_cb:
                 spk_info = f" [{spk}]" if spk else ""
@@ -619,9 +801,11 @@ class GPUASREngine:
                     if ts_list:
                         subs = _ts_to_subtitle_lines(
                             ts_list, raw_text, g0, spk,
-                            self.cc, _g_output_simplified,
+                            self.cc if self._should_opencc() else None,
+                            _g_output_simplified,
                             aligner_processor=self.aligner.aligner_processor,
                             language=align_lang,
+                            break_on_space=_g_break_on_space,
                         )
                         if subs:
                             all_subs.extend(subs)
@@ -631,11 +815,18 @@ class GPUASREngine:
 
             if not aligned:
                 # ── 比例估算 Fallback ──────────────────────────────────────
-                text = raw_text if _g_output_simplified else self.cc.convert(raw_text)
-                lines = _split_to_lines(text)
-                all_subs.extend(
+                text = self._convert_out(raw_text)
+                lines = _split_to_lines(text, break_on_space=_g_break_on_space)
+                seg_subs = [
                     (s, e, line, spk) for s, e, line in _assign_ts(lines, g0, g1)
-                )
+                ]
+                # 合併單字孤兒行（break_on_space 對逐字吐空白的異常段尤其需要）
+                try:
+                    from subtitle_lines import _merge_orphan_lines
+                    seg_subs = _merge_orphan_lines(seg_subs)
+                except Exception:
+                    pass
+                all_subs.extend(seg_subs)
 
         if not all_subs:
             return None
@@ -872,11 +1063,14 @@ class App(ctk.CTk):
         self._endpoint_tab = EndpointTab(self.tabs.tab("  端點  "), self)
         self._endpoint_tab.pack(fill="both", expand=True)
 
-        # 「模型」分頁：裝置選擇（GPU 版模型固定，無模型 combo）+ 模型路徑等
+        # 「模型」分頁：裝置選擇 + GPU 模型下拉（掃 GPUModel/）+ 模型路徑等
         from model_tab import ModelTab
+        gpu_models = _scan_gpu_models()
         self._model_tab = ModelTab(
             self.tabs.tab("  模型  "), self,
             show_model_select=False, device_default="CUDA",
+            gpu_models=gpu_models,
+            gpu_model_default=_default_gpu_model(gpu_models),
         )
         self._model_tab.pack(fill="both", expand=True)
 
@@ -884,7 +1078,8 @@ class App(ctk.CTk):
         # GPU 版語系於建立時即預填完整清單（沿用舊行為），載入完成後轉 readonly
         self._settings_tab = SettingsTab(
             self.tabs.tab("  設定  "), self,
-            lang_values=["自動偵測"] + SUPPORTED_LANGUAGES, lang_state="disabled")
+            lang_values=["自動偵測"] + SUPPORTED_LANGUAGES, lang_state="disabled",
+            show_opencc_toggle=True)
         self._settings_tab.pack(fill="both", expand=True)
 
     # ── 音檔轉字幕 tab ─────────────────────────────────
@@ -956,6 +1151,26 @@ class App(ctk.CTk):
             command=self._on_align_toggle,
         )
         self.align_chk.pack(side="left", padx=(18, 0))
+
+        if self.engine.segment_mode == "official":
+            official_row = ctk.CTkFrame(parent, fg_color="transparent")
+            official_row.pack(fill="x", padx=8, pady=(2, 2))
+            self.official_chunk_var = ctk.StringVar(
+                value=_fmt_minutes(OFFICIAL_CHUNK_MINUTES_DEFAULT)
+            )
+            ctk.CTkLabel(
+                official_row, text="官方切片：", font=FONT_BODY,
+                text_color="#AAAAAA",
+            ).pack(side="left", padx=(0, 4))
+            self.official_chunk_entry = ctk.CTkEntry(
+                official_row, textvariable=self.official_chunk_var,
+                width=70, height=28, font=FONT_BODY,
+            )
+            self.official_chunk_entry.pack(side="left")
+            ctk.CTkLabel(
+                official_row, text="分鐘", font=FONT_BODY,
+                text_color="#AAAAAA",
+            ).pack(side="left", padx=(6, 0))
 
         hint_hdr = ctk.CTkFrame(parent, fg_color="transparent")
         hint_hdr.pack(fill="x", padx=8, pady=(6, 0))
@@ -1190,6 +1405,17 @@ class App(ctk.CTk):
         vad = settings.get("vad_threshold")
         if vad is not None:
             VAD_THRESHOLD = float(vad)
+        try:
+            minutes = float(settings.get(
+                "official_chunk_minutes", OFFICIAL_CHUNK_MINUTES_DEFAULT
+            ))
+            if minutes <= 0:
+                minutes = OFFICIAL_CHUNK_MINUTES_DEFAULT
+        except Exception:
+            minutes = OFFICIAL_CHUNK_MINUTES_DEFAULT
+        self.engine.official_chunk_sec = minutes * 60.0
+        if hasattr(self, "official_chunk_var"):
+            self.official_chunk_var.set(_fmt_minutes(minutes))
         if hasattr(self, "_settings_tab"):
             self._settings_tab.sync_prefs(settings)
         if hasattr(self, "_model_tab"):
@@ -1209,6 +1435,56 @@ class App(ctk.CTk):
         eng = getattr(self, "engine", None)
         if eng and hasattr(eng, "rebuild_cc"):
             eng.rebuild_cc()
+
+    def _on_opencc_toggle(self, on: bool):
+        """OpenCC 繁化開關：關閉＝輸出模型原文（逐字），不做任何簡繁轉換。"""
+        global _g_opencc_enabled
+        _g_opencc_enabled = bool(on)
+        self._patch_setting("opencc_enabled", _g_opencc_enabled)
+
+    def _on_break_on_space_toggle(self, on: bool):
+        """字幕「空白也斷句」開關：無標點模型（pkm-ft）開啟可恢復自然斷句。"""
+        global _g_break_on_space
+        _g_break_on_space = bool(on)
+        self._patch_setting("break_on_space", _g_break_on_space)
+
+    def _on_gpu_model_change(self, value: str):
+        """GPU 模型切換：更新 ASR_MODEL_NAME + 依模型調整 OpenCC/斷句預設 + 重新載入。"""
+        global ASR_MODEL_NAME, _g_opencc_enabled, _g_break_on_space
+        name = (value or "").strip()
+        if not name or name == ASR_MODEL_NAME:
+            return
+        if self._converting:
+            messagebox.showwarning("提示", "轉換進行中，請等候完成後再切換模型")
+            # 還原下拉到目前模型
+            if hasattr(self, "gpu_model_var"):
+                self.gpu_model_var.set(ASR_MODEL_NAME)
+            return
+        ASR_MODEL_NAME = name
+        self._patch_setting("gpu_asr_model", name)
+        # 微調模型原生繁體 → OpenCC 預設關；帶標點的模型（基座 / v2+）→ 空白斷句預設關
+        is_ft = _model_outputs_traditional(name)
+        _g_opencc_enabled = not is_ft
+        _g_break_on_space = not _model_has_punct(name)
+        self._patch_setting("opencc_enabled", _g_opencc_enabled)
+        self._patch_setting("break_on_space", _g_break_on_space)
+        # 同步「設定」分頁的 OpenCC / 斷句勾選與相依控件狀態
+        st = getattr(self, "_settings_tab", None)
+        if st is not None and hasattr(st, "_opencc_var"):
+            st._opencc_var.set(_g_opencc_enabled)
+            if hasattr(st, "_sync_vocab_state"):
+                st._sync_vocab_state()
+        if st is not None and hasattr(st, "_bos_var"):
+            st._bos_var.set(_g_break_on_space)
+        # 刷新「模型」分頁的模型路徑標籤（反映新模型子目錄）
+        mt = getattr(self, "_model_tab", None)
+        if mt is not None and hasattr(mt, "_model_path_lbl"):
+            try:
+                mt._model_path_lbl.configure(text=mt._get_model_path_text())
+            except Exception:
+                pass
+        # 重新載入以套用新模型（load() 會依新的 ASR_MODEL_NAME 載入）
+        self._on_reload_models()
 
     def _on_ui_scale_change(self, scale: float):
         """介面縮放：等比放大／縮小所有元件與字體。"""
@@ -1237,9 +1513,35 @@ class App(ctk.CTk):
     def _startup_check(self):
         """背景執行緒：套用 UI 偏好 → 檢查模型存在 → 載入。"""
         settings = self._load_settings()
-        global _g_output_simplified, _g_vocab_convert
+        global _g_output_simplified, _g_vocab_convert, _g_opencc_enabled
+        global _g_break_on_space, ASR_MODEL_NAME
         _g_output_simplified = settings.get("output_simplified", False)
         _g_vocab_convert     = settings.get("vocab_convert", True)
+
+        # ── GPU 模型選擇：依設定 / 掃描 GPUModel 解析（DEPLOY-1）──────────
+        available = _scan_gpu_models()
+        saved_model = settings.get("gpu_asr_model")
+        if saved_model and saved_model in available:
+            ASR_MODEL_NAME = saved_model
+        elif available:
+            ASR_MODEL_NAME = _default_gpu_model(available)
+        # 否則保留模組預設，交由下方 missing-model 錯誤處理
+        settings["gpu_asr_model"] = ASR_MODEL_NAME
+
+        # ── OpenCC 開關：有存值用存值，否則依模型推定（微調→關 / 原始→開）──
+        if "opencc_enabled" in settings:
+            _g_opencc_enabled = bool(settings.get("opencc_enabled"))
+        else:
+            _g_opencc_enabled = not _model_outputs_traditional(ASR_MODEL_NAME)
+        settings["opencc_enabled"] = _g_opencc_enabled
+
+        # ── 空白斷句：有存值用存值，否則依模型推定（無標點微調→開 / 帶標點→關）──
+        if "break_on_space" in settings:
+            _g_break_on_space = bool(settings.get("break_on_space"))
+        else:
+            _g_break_on_space = not _model_has_punct(ASR_MODEL_NAME)
+        settings["break_on_space"] = _g_break_on_space
+
         self.after(0, lambda s=settings: self._apply_ui_prefs(s))
 
         asr_path = GPU_MODEL_DIR / ASR_MODEL_NAME
@@ -1276,6 +1578,8 @@ class App(ctk.CTk):
     def _on_models_ready(self):
         self.device_combo.configure(state="readonly")
         self.reload_btn.configure(state="normal")
+        if hasattr(self, "gpu_model_combo"):
+            self.gpu_model_combo.configure(state="readonly")
         self.convert_btn.configure(state="normal")
         self.rt_start_btn.configure(state="normal")
         self.lang_combo.configure(state="readonly")
@@ -1307,6 +1611,8 @@ class App(ctk.CTk):
     def _on_models_failed(self, device: str, reason: str):
         self.device_combo.configure(state="readonly")
         self.reload_btn.configure(state="normal")
+        if hasattr(self, "gpu_model_combo"):
+            self.gpu_model_combo.configure(state="readonly")
         self.status_dot.configure(
             text=f"❌ {device} 載入失敗，請切換裝置後點「重新載入」",
             text_color="#EF5350",
@@ -1327,6 +1633,8 @@ class App(ctk.CTk):
         self.convert_btn.configure(state="disabled")
         self.rt_start_btn.configure(state="disabled")
         self.reload_btn.configure(state="disabled")
+        if hasattr(self, "gpu_model_combo"):
+            self.gpu_model_combo.configure(state="disabled")
         threading.Thread(target=self._load_models, daemon=True).start()
 
     def _ready_summary(self, device_label: str) -> str:
@@ -1442,6 +1750,17 @@ class App(ctk.CTk):
             if self.engine.ready:
                 self.convert_btn.configure(state="normal")
 
+    def _parse_official_chunk_minutes(self) -> float | None:
+        var = getattr(self, "official_chunk_var", None)
+        raw = var.get().strip() if var is not None else ""
+        try:
+            minutes = float(raw or OFFICIAL_CHUNK_MINUTES_DEFAULT)
+        except ValueError:
+            return None
+        if minutes <= 0:
+            return None
+        return minutes
+
     def _on_convert(self):
         if self._converting:
             return
@@ -1459,6 +1778,14 @@ class App(ctk.CTk):
         self._file_diarize    = self._diarize_var.get()
         n_spk_sel             = self.n_spk_combo.get()
         self._file_n_speakers = int(n_spk_sel) if n_spk_sel.isdigit() else None
+        if self.engine.segment_mode == "official":
+            minutes = self._parse_official_chunk_minutes()
+            if minutes is None:
+                messagebox.showwarning("提示", "官方切片分鐘需為大於 0 的數字")
+                return
+            self.engine.official_chunk_sec = minutes * 60.0
+            self.official_chunk_var.set(_fmt_minutes(minutes))
+            self._patch_setting("official_chunk_minutes", minutes)
 
         # 影片檔案需要先確認 ffmpeg
         try:
@@ -1522,7 +1849,14 @@ class App(ctk.CTk):
                          else (f"  提示：{context}" if context else ""))
             diar_info = (f"  [說話者分離，人數：{n_speakers or '自動'}]"
                          if diarize else "")
-            self._file_log(f"開始處理：{path.name}{lang_info}{hint_info}{diar_info}")
+            chunk_info = ""
+            if self.engine.segment_mode == "official":
+                chunk_info = (
+                    f"  [官方切片：{_fmt_minutes(self.engine.official_chunk_sec / 60.0)} 分鐘]"
+                )
+            self._file_log(
+                f"開始處理：{path.name}{lang_info}{hint_info}{diar_info}{chunk_info}"
+            )
             srt = self.engine.process_file(
                 proc_path, progress_cb=prog_cb, language=language,
                 context=context, diarize=diarize, n_speakers=n_speakers,

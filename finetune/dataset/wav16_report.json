@@ -1,0 +1,170 @@
+[
+  {
+    "speaker": "general",
+    "id": "DOoWigrKX2s",
+    "wav": "wav16\\general\\DOoWigrKX2s.wav",
+    "duration": 1512.31,
+    "status": "exists"
+  },
+  {
+    "speaker": "yt1",
+    "id": "-V_Wtg_Hi_Y",
+    "wav": "wav16\\yt1\\-V_Wtg_Hi_Y.wav",
+    "duration": 4279.84,
+    "status": "exists"
+  },
+  {
+    "speaker": "yt1",
+    "id": "3fZVXAvlwuk",
+    "wav": "wav16\\yt1\\3fZVXAvlwuk.wav",
+    "duration": 4278.71,
+    "status": "exists"
+  },
+  {
+    "speaker": "yt1",
+    "id": "5O6yXXJQCYg",
+    "wav": "wav16\\yt1\\5O6yXXJQCYg.wav",
+    "duration": 4581.23,
+    "status": "ok"
+  },
+  {
+    "speaker": "yt1",
+    "id": "8IAdoWpwk80",
+    "wav": "wav16\\yt1\\8IAdoWpwk80.wav",
+    "duration": 4187.36,
+    "status": "ok"
+  },
+  {
+    "speaker": "yt1",
+    "id": "8ygD7ShM2PE",
+    "wav": "wav16\\yt1\\8ygD7ShM2PE.wav",
+    "duration": 740.79,
+    "status": "ok"
+  },
+  {
+    "speaker": "yt1",
+    "id": "_a9qgZnsDG8",
+    "wav": "wav16\\yt1\\_a9qgZnsDG8.wav",
+    "duration": 4772.21,
+    "status": "ok"
+  },
+  {
+    "speaker": "yt1",
+    "id": "ed0e8KviemU",
+    "wav": "wav16\\yt1\\ed0e8KviemU.wav",
+    "duration": 4069.68,
+    "status": "ok"
+  },
+  {
+    "speaker": "yt1",
+    "id": "f0KaoGhjfw8",
+    "wav": "wav16\\yt1\\f0KaoGhjfw8.wav",
+    "duration": 4601.8,
+    "status": "ok"
+  },
+  {
+    "speaker": "yt1",
+    "id": "JcGKhnklsyY",
+    "wav": "wav16\\yt1\\JcGKhnklsyY.wav",
+    "duration": 3838.47,
+    "status": "ok"
+  },
+  {
+    "speaker": "yt1",
+    "id": "L-rmLCADfh4",
+    "wav": "wav16\\yt1\\L-rmLCADfh4.wav",
+    "duration": 2013.23,
+    "status": "exists"
+  },
+  {
+    "speaker": "yt1",
+    "id": "NGsJUfvi-y0",
+    "wav": "wav16\\yt1\\NGsJUfvi-y0.wav",
+    "duration": 4033.71,
+    "status": "exists"
+  },
+  {
+    "speaker": "yt1",
+    "id": "r0Ta14PaXzE",
+    "wav": "wav16\\yt1\\r0Ta14PaXzE.wav",
+    "duration": 4079.0,
+    "status": "exists"
+  },
+  {
+    "speaker": "yt1",
+    "id": "r9kiS91vovo",
+    "wav": "wav16\\yt1\\r9kiS91vovo.wav",
+    "duration": 3202.33,
+    "status": "ok"
+  },
+  {
+    "speaker": "yt1",
+    "id": "VEeH7XM42TA",
+    "wav": "wav16\\yt1\\VEeH7XM42TA.wav",
+    "duration": 4737.93,
+    "status": "ok"
+  },
+  {
+    "speaker": "yt1",
+    "id": "ZmCH9tKz6vE",
+    "wav": "wav16\\yt1\\ZmCH9tKz6vE.wav",
+    "duration": 3546.8,
+    "status": "exists"
+  },
+  {
+    "speaker": "yt2",
+    "id": "88VOGDegBm8",
+    "wav": "wav16\\yt2\\88VOGDegBm8.wav",
+    "duration": 2270.41,
+    "status": "exists"
+  },
+  {
+    "speaker": "yt2",
+    "id": "qvKIbIDEF2k",
+    "wav": "wav16\\yt2\\qvKIbIDEF2k.wav",
+    "duration": 2271.45,
+    "status": "exists"
+  },
+  {
+    "speaker": "yt2",
+    "id": "VmyNYiNG2W0",
+    "wav": "wav16\\yt2\\VmyNYiNG2W0.wav",
+    "duration": 2077.53,
+    "status": "exists"
+  },
+  {
+    "speaker": "yt3",
+    "id": "aTUC3aNPFOQ",
+    "wav": "wav16\\yt3\\aTUC3aNPFOQ.wav",
+    "duration": 1233.54,
+    "status": "exists"
+  },
+  {
+    "speaker": "yt4",
+    "id": "NTt8wMs6OUE",
+    "wav": "wav16\\yt4\\NTt8wMs6OUE.wav",
+    "duration": 2137.67,
+    "status": "exists"
+  },
+  {
+    "speaker": "yt5",
+    "id": "h51REmf4JNY",
+    "wav": "wav16\\yt5\\h51REmf4JNY.wav",
+    "duration": 777.03,
+    "status": "exists"
+  },
+  {
+    "speaker": "yt5",
+    "id": "Jwy3M2W987c",
+    "wav": "wav16\\yt5\\Jwy3M2W987c.wav",
+    "duration": 948.38,
+    "status": "exists"
+  },
+  {
+    "speaker": "yt5",
+    "id": "VM6LcDCdV1M",
+    "wav": "wav16\\yt5\\VM6LcDCdV1M.wav",
+    "duration": 968.54,
+    "status": "exists"
+  }
+]

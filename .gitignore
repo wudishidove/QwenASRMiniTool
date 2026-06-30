@@ -53,6 +53,7 @@ installer/
 !build.bat
 !build_venv.bat
 !start-gpu.bat
+!start-gpu-official.bat
 !make_release_zip.bat
 
 # ── 開發/測試用腳本 ──────────────────────────────────
@@ -107,3 +108,7 @@ UI.txt
 # ── 允許 Readme 資料夾內的截圖 ─────────────────────────
 !Readme/*.jpg
 !Readme/*.png
+# ── Fine-tune workspace generated assets ─────────────────────
+finetune/venv-train/
+finetune/adapters/**/adapter_model.safetensors
+finetune/dataset/raw/.dl_log.txt

@@ -68,12 +68,16 @@ class ModelTab(ctk.CTkScrollableFrame):
         show_model_select: bool = True,
         device_default: str = "CPU",
         show_cpu_section: bool = True,
+        gpu_models: list[str] | None = None,
+        gpu_model_default: str = "",
     ):
         super().__init__(parent, fg_color=("gray92", "gray17"))
         self._app               = app
         self._show_model_select = show_model_select
         self._device_default    = device_default
         self._show_cpu_section  = show_cpu_section
+        self._gpu_models        = gpu_models or []
+        self._gpu_model_default = gpu_model_default
         self._build()
 
     # ══ 建構 UI ══════════════════════════════════════════════════════
@@ -115,6 +119,27 @@ class ModelTab(ctk.CTkScrollableFrame):
                 command=self._app._on_reload_models,
             )
             self._app.reload_btn.pack(side="left", padx=(12, 0))
+
+        # GPU 版模型下拉（掃 GPUModel/；CPU 版走下方 show_model_select 分支）
+        if not self._show_model_select and self._gpu_models:
+            grow = ctk.CTkFrame(self, fg_color="transparent")
+            grow.pack(fill="x", padx=12, pady=(0, 4))
+            ctk.CTkLabel(
+                grow, text="模型：", font=FONT_BODY, width=72, anchor="w",
+            ).pack(side="left")
+
+            default = (
+                self._gpu_model_default
+                if self._gpu_model_default in self._gpu_models
+                else self._gpu_models[0]
+            )
+            self._app.gpu_model_var   = ctk.StringVar(value=default)
+            self._app.gpu_model_combo = ctk.CTkComboBox(
+                grow, values=self._gpu_models, variable=self._app.gpu_model_var,
+                width=300, state="disabled", font=FONT_BODY,
+                command=self._app._on_gpu_model_change,
+            )
+            self._app.gpu_model_combo.pack(side="left", padx=(4, 0))
 
         # 核心 + 模型選擇列（CPU 版才有）
         if self._show_model_select:
@@ -334,6 +359,12 @@ class ModelTab(ctk.CTkScrollableFrame):
 
     def sync_prefs(self, settings: dict):
         """由 App._apply_ui_prefs 呼叫，同步路徑 / 鏡像 / CPU 控件狀態。"""
+        # GPU 模型下拉（依儲存的 gpu_asr_model 還原；用 var.set 不觸發重新載入）
+        if self._gpu_models and hasattr(self._app, "gpu_model_var"):
+            name = settings.get("gpu_asr_model")
+            if name and name in self._gpu_models:
+                self._app.gpu_model_var.set(name)
+
         # 下載來源（鏡像站）
         if hasattr(self, "_mirror_seg"):
             mirror = (settings.get("hf_mirror", "") or "").strip()

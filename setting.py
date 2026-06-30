@@ -55,11 +55,13 @@ class SettingsTab(ctk.CTkScrollableFrame):
 
     def __init__(self, parent, app, *,
                  lang_values: list[str] | None = None,
-                 lang_state: str = "disabled"):
+                 lang_state: str = "disabled",
+                 show_opencc_toggle: bool = False):
         super().__init__(parent, fg_color=("gray92", "gray17"))
-        self._app           = app
-        self._lang_values   = lang_values or ["自動偵測"]
-        self._lang_state    = lang_state
+        self._app                = app
+        self._lang_values        = lang_values or ["自動偵測"]
+        self._lang_state         = lang_state
+        self._show_opencc_toggle = show_opencc_toggle
         self._build()
 
     # ══ 建構 UI ══════════════════════════════════════════════════════
@@ -386,6 +388,49 @@ class SettingsTab(ctk.CTkScrollableFrame):
     # ── 3. 中文輸出語言 ───────────────────────────────────────────────
 
     def _build_language_section(self):
+        # OpenCC 繁化主開關（僅 GPU 版顯示；關閉＝輸出模型原文逐字）
+        if self._show_opencc_toggle:
+            orow = ctk.CTkFrame(self, fg_color="transparent")
+            orow.pack(fill="x", padx=12, pady=(10, 2))
+            ctk.CTkLabel(
+                orow, text="🔤 OpenCC 繁化", font=FONT_BODY, width=130, anchor="w",
+            ).pack(side="left")
+            self._opencc_var = ctk.BooleanVar(value=True)
+            self._opencc_chk = ctk.CTkCheckBox(
+                orow, text="啟用簡轉繁", variable=self._opencc_var,
+                font=FONT_BODY, command=self._on_opencc_chk,
+            )
+            self._opencc_chk.pack(side="left")
+
+            ctk.CTkLabel(
+                self,
+                text="微調模型（pkm-ft）原生輸出繁體，建議關閉以保留專名；原始 Qwen3-ASR "
+                     "輸出簡體，需開啟轉繁。關閉時直接輸出模型原文（逐字），下方繁簡與詞彙設定不生效。",
+                font=FONT_SMALL, text_color=("gray40", "#AAAAAA"), anchor="w",
+                wraplength=480, justify="left",
+            ).pack(fill="x", padx=12, pady=(0, 6))
+
+            # 空白斷句（無標點模型適用）
+            brow = ctk.CTkFrame(self, fg_color="transparent")
+            brow.pack(fill="x", padx=12, pady=(2, 2))
+            ctk.CTkLabel(
+                brow, text="🔪 字幕斷句", font=FONT_BODY, width=130, anchor="w",
+            ).pack(side="left")
+            self._bos_var = ctk.BooleanVar(value=True)
+            self._bos_chk = ctk.CTkCheckBox(
+                brow, text="空白也斷句", variable=self._bos_var,
+                font=FONT_BODY, command=self._on_bos_chk,
+            )
+            self._bos_chk.pack(side="left")
+
+            ctk.CTkLabel(
+                self,
+                text="微調模型（pkm-ft）輸出幾乎無標點、改用空白標記語句邊界；開啟後在空白處斷行，"
+                     "恢復自然斷句（關閉則只能每 20 字硬切，會把詞切斷）。原始 Qwen3-ASR 有標點，可關閉。",
+                font=FONT_SMALL, text_color=("gray40", "#AAAAAA"), anchor="w",
+                wraplength=480, justify="left",
+            ).pack(fill="x", padx=12, pady=(0, 6))
+
         row = ctk.CTkFrame(self, fg_color="transparent")
         row.pack(fill="x", padx=12, pady=(10, 4))
 
@@ -430,11 +475,33 @@ class SettingsTab(ctk.CTkScrollableFrame):
         if hasattr(self._app, "_on_vocab_convert_change"):
             self._app._on_vocab_convert_change(self._vocab_var.get())
 
+    def _on_opencc_chk(self):
+        if hasattr(self._app, "_on_opencc_toggle"):
+            self._app._on_opencc_toggle(self._opencc_var.get())
+        self._sync_vocab_state()
+
+    def _on_bos_chk(self):
+        if hasattr(self._app, "_on_break_on_space_toggle"):
+            self._app._on_break_on_space_toggle(self._bos_var.get())
+
     def _sync_vocab_state(self):
-        """簡體模式下停用詞彙轉換勾選（無作用）。"""
+        """依 OpenCC 主開關與繁簡模式，啟用/停用相依控件。
+
+        - OpenCC 關 → 繁簡段與詞彙轉換皆無作用，整段停用。
+        - OpenCC 開 + 簡體 → 詞彙轉換停用（簡體不適用）。
+        """
+        opencc_on = True
+        if hasattr(self, "_opencc_var"):
+            opencc_on = bool(self._opencc_var.get())
+        try:
+            self.chinese_seg.configure(state="normal" if opencc_on else "disabled")
+        except Exception:
+            pass
         simp = "簡" in self.chinese_seg.get()
         try:
-            self._vocab_chk.configure(state="disabled" if simp else "normal")
+            self._vocab_chk.configure(
+                state="normal" if (opencc_on and not simp) else "disabled"
+            )
         except Exception:
             pass
 
@@ -569,6 +636,14 @@ class SettingsTab(ctk.CTkScrollableFrame):
         self.chinese_seg.set(
             "簡體中文" if settings.get("output_simplified") else "繁體中文"
         )
+
+        # OpenCC 繁化主開關（GPU 版）
+        if hasattr(self, "_opencc_var"):
+            self._opencc_var.set(bool(settings.get("opencc_enabled", True)))
+
+        # 空白斷句開關（GPU 版）
+        if hasattr(self, "_bos_var"):
+            self._bos_var.set(bool(settings.get("break_on_space", True)))
 
         # 簡繁詞彙轉換
         if hasattr(self, "_vocab_var"):

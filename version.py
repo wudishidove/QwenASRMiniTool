@@ -10,12 +10,14 @@
 """
 from __future__ import annotations
 
-# 本次編譯版本（dist2）。1.0.9：新增 Whisper/Breeze-ASR-26 推理核心
-# (CrispASR / Vulkan，-nf -bo1 達 ~35x，繁中/台語特化)、qwen3 ForcedAligner
-# GGUF 字級時間軸對齊、核心切換 Vulkan context 防當機修正、字幕分行全引擎統一
-# (subtitle_lines，標點/空白邊界切 + MAX_CHARS 保護 + 孤兒行合併)。
-# 最新已發佈 Release 為 1.0.8。
-__version__ = "1.0.9"
+# 本次編譯版本（dist2）。1.0.10：GPU CUDA workflow V4 紀錄。
+# 新增 start-gpu-official.bat 官方低能量長音訊切片入口，並讓 start-gpu.bat
+# 同時支援發行包 cudagpu\ 與原始碼根目錄 layout；GPUModel/ 會自動掃描可用
+# Qwen3-ASR 模型並提供下拉切換，預設偏好 pkm-ft-1.7b-v2。
+# GPU 版新增 OpenCC 繁化主開關、空白斷句開關與模型相依預設；ForcedAligner
+# 字幕時間軸改以 raw_text 字元對位，避免 tokenizer 丟符號時掉字或標點錯位。
+# 前一版為 1.0.9。
+__version__ = "1.0.10"
 
 # 自動更新來源：GitHub repo（owner/name）
 GITHUB_REPO = "dseditor/QwenASRMiniTool"

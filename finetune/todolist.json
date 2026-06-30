@@ -1,0 +1,552 @@
+{
+  "plan": "微調 Qwen3-ASR 用於寶可夢對戰語音辨識",
+  "plan_file": "finetune/dataset/ultracode-finetune-asr-nifty-blum.md",
+  "created": "2026-06-28",
+  "last_updated": "2026-06-29T-v4",
+  "progress_log": [
+    "2026-06-28: ENV-1/2/4 done (venv-train --system-site-packages, datasets 5.0.0 + jiwer installed, transformers stays 4.57.6, dataset dirs created). ENV-3 0.6B download in_progress (bg).",
+    "2026-06-28: DATA-1 全量下載背景進行中（h51 已完成驗證）。建 asr_labels.py(LabelBuilder+collate) 與 verify_harness.py，對真實 0.6B 驗證全數通過：ERROR-3 動態audio_pad(10s→130/7s→91)、ERROR-4 labels、BLOCKER-1 thinker loss=7.645、BLOCKER-2 LoRA thinker=196/audio_tower=0、TRAIN-4 grad流向、transcribe相容。實測 h51 輸出『mega化石一龙』誤判印證專名問題。",
+    "2026-06-28: 使用者修正資料切分——test 改用 yt5（3部~45min，達標）取代 yt3（單部20.6min過小）；train=yt1+yt2+yt3+yt4（~8.9h/4講者）；val=各train影片尾段10%。原 yt3 fallback 取消。",
+    "2026-06-28: DATA-1 完成全 14 部（2 部 403 重試成功，皆音訊+srt 齊全）。建 srt_clean.py 並測試 h51（337 cue，英文術語保留）= DATA-3 done。建 02_to_wav16.py 轉 16k mono（背景執行中）= DATA-2。",
+    "2026-06-28: 使用者質疑 text_norm 必要性→實測證實資料本為乾淨繁體，OpenCC(s2twp/s2t)淨破壞專名。改 norm-v2-no-opencc：移除繁簡轉換，只留全形半形+CER去標點。發現生產 app-gpu.py:598 同樣套 OpenCC 會破壞專名，記入 DEPLOY-1。",
+    "2026-06-28: 03_make_clips.py 切片完成 train2452/val273/test204(yt5,40min)。04_qa_gate.py QA 全過，產出 *.clean.jsonl。DATA-6~10 done。",
+    "2026-06-28: 寫 train_lora.py（手寫迴圈，forward走thinker）。過擬合煙霧 24 clips loss 7→0.0003（TRAIN-4 done）。寫 merge_lora.py：merge→重組完整目錄→qwen_asr 載入→transcribe→parse_asr_output 3/3 通過（ERROR-5 驗證）。修 generation_config 嚴格驗證(temperature/do_sample)。全部 BLOCKER/ERROR 修正端到端驗證完成。",
+    "2026-06-28: 寫 eval.py(EVAL-0)+build_lexicon.py(18詞bootstrap)。發現 base 輸出簡體 vs 繁ref 灌爆 CER，修 for_cer 加對稱 t2s 書寫中性化(只計分用)。P0/M0 得真 floor：B0 CER0.217/F0.712；B1(偏置) CER0.194/F0.894/recall0.809。",
+    "2026-06-28: Phase2 0.6B LoRA(no replay) 訓練完成 train_loss0.17/val0.38。merge+eval：LoRA 同基座 entity-F 0.638→0.894/recall+34pt、CER 0.249→0.222；0.6B+LoRA(off)追平1.7B+bias floor的entity。0.6B CER仍輸1.7B(基座)。偏置反傷微調模型(FP21)。M2決策=GO to 1.7B。啟動 Phase3 1.7B 訓練。",
+    "2026-06-28: Phase3 1.7B LoRA 訓練 val0.34。merge→pkm-ft-1.7b-v1。FULL204 對決：B1 floor CER0.216/F0.866/recall0.764 vs 1.7B+LoRA(off) CER0.199/F0.933/recall0.882 → 全面勝出+原生繁體。載入閘通過(eval 經 qwen_asr 載入+transcribe204)。風險:無replay遺忘未測。",
+    "2026-06-28: 使用者指定一般影片(DOoWigrKX2s台灣新聞)做遺忘抽查。base CER0.219 vs 微調0.195→不遺忘反更好。結論不需replay。微調1.7B同時:域內勝floor+通用不退化+原生繁體。可進入部署A/B。",
+    "2026-06-28: 使用者要求暫緩 UI 整合，先寫交接文件 finetune/結果.md（完整成果+經驗+檔案地圖+後續TODO）。",
+    "2026-06-29: V2(逗號重訓,現部署)→V3(純YT1過擬合)詳見結果.md。V4 修 V3 實測三詞誤判(撒嬌→沙雕/戲法空間→細化空間/仙子伊布→先一步)：稽核確認非標籤汙染而是訓練訊號弱(撒嬌15/戲法2/仙子伊布0 clip)。新增 make_v4_split.py(manifest層重組,不重切:yt5 h51REmf4JNY移入train、其餘2部yt5留hold-out、yt4 NTt8wMs6OUE當新test)+make_v4_replay.py(三詞×8→replay.v4)。train.v4 4529clip/13.16h、test.v4 326。best_val0.2190。檢查點掃描採last(val.v4無三詞,best-by-val偏)：hold-out recall 戲法空間3→9/14、仙子伊布0→5/9、撒嬌實測切片✓。merge→pkm-ft-1.7b-v4(非預設,下拉可選)。caveat:離線長/短窗 V3/V4 皆正確輸出撒嬌,無法重現 production 沙雕→屬app端VAD切窗,須app實轉確認。"
+  ],
+  "strategy": "vendored qwen_asr 模型碼 + PEFT LoRA（只掛 thinker 文字層），偏置為輔。0.6B 煙霧→3-5h 首跑→go/no-go→1.7B/擴量。",
+  "legend": {
+    "status": "pending | in_progress | done | blocked | needs_user",
+    "owner": "claude = 可自動執行 | user = 需使用者（人工校正/聽音/拍板）| both"
+  },
+  "critical_fixes_never_forget": {
+    "BLOCKER-1": "訓練入口走 model.thinker：loss 的 forward() 在 model.thinker（modeling_qwen3_asr.py:1159-1250），top-level 只有 generate()。wrapper 直接呼叫 model.thinker(input_ids=..., labels=...).loss，不能裸丟 Trainer(model=top_level)。",
+    "BLOCKER-2": "target_modules 用精確 regex 避開 audio tower（audio tower :472 也有同名 q/k/v_proj）：r\"thinker\\.model\\.layers\\.\\d+\\.(self_attn\\.(q|k|v|o)_proj|mlp\\.(gate|up|down)_proj)\"。訓練前 print_trainable_parameters() 確認 audio tower 命中 0 個。",
+    "ERROR-3": "labels 動態建構，不寫死 390（390×audio_pad 只對 30s 成立）。每段呼叫 processor 取 input_ids，動態定位 audio_pad(151676) 區段再 mask。",
+    "ERROR-4": "手建 labels 為唯一路徑（無 apply_chat_template(output_labels=True)）。依 prompt_template.json 手組：prefix_ids + N×audio_pad(151676) + suffix_ids[151670,151645,198,151644,77091,198] + zh language_suffix[11528,8453,151704] + 轉錄 token + eos(151645)。只監督『language_suffix+轉錄+eos』，其餘 -100。collator：labels 長度==input_ids 長度、padding 填 -100。斷言 labels.shape==input_ids.shape 且 (labels!=-100).sum()==轉錄+尾巴 token 數。",
+    "ERROR-5": "部署＝重組完整 top-level HF 目錄：複製原始 Qwen3-ASR-* 目錄，把 thinker 的 merged safetensors 覆寫進去，保留 config.json/preprocessor_config.json/chat_template.json/generation_config.json/特殊 token/model.safetensors.index.json。放 GPUModel\\pkm-ft-vN\\（不覆寫原始）。",
+    "backward-smoke": "跑任何 epoch 前先確認 loss 非 NaN、LoRA param 有 grad、audio_tower param .grad is None、LoRA patch 後 top-level generate() 仍可走；20-30 句過擬合到 loss≈0。",
+    "GOTCHA-gradckpt": "gradient_checkpointing_enable / enable_input_require_grads 必須對 model.thinker 呼叫，不能對 top-level Qwen3ASRForConditionalGeneration（它未實作 get_input_embeddings，會 NotImplementedError）。已於 verify_harness.py 實證。"
+  },
+  "environment_facts_verified": {
+    "gpu": "RTX 5090 / ~32GB / sm_120，VRAM 非限制",
+    "torch": "2.7.0+cu128, CUDA True",
+    "transformers": "4.57.6（不升級）",
+    "qwen_asr_path": "C:\\Users\\gogo\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\qwen_asr",
+    "deps_present": [
+      "peft",
+      "accelerate",
+      "soundfile",
+      "soxr",
+      "opencc"
+    ],
+    "deps_missing": [
+      "datasets",
+      "jiwer"
+    ],
+    "models_present": [
+      "GPUModel\\Qwen3-ASR-1.7B",
+      "GPUModel\\Qwen3-ForcedAligner-0.6B"
+    ],
+    "models_needed": [
+      "Qwen/Qwen3-ASR-0.6B (non-hf)"
+    ]
+  },
+  "key_files": {
+    "integration_target": "qwen/app-gpu.py (ASR_MODEL_NAME:63, from_pretrained:541, transcribe(context=):583-598, OpenCC:425-426,570)",
+    "vendored_model_code": "site-packages/qwen_asr/core/transformers_backend/{modeling_qwen3_asr.py,processing_qwen3_asr.py,configuration_qwen3_asr.py}",
+    "label_truth": "qwen/prompt_template.json (zh 尾巴[11528,8453,151704], asr_text_id 151704, audio_pad 151676)",
+    "bias_lexicon": "qwen/pokemon.txt (需升級成 canonical TSV)",
+    "data_sources": "qwen/finetune/dataset/yt_source.txt (yt1=6, yt2=3, yt3=1, yt4=1, yt5=3 部)",
+    "model_output": "qwen/GPUModel/pkm-ft-vN/ (新建，不覆寫原始)",
+    "aligner": "qwen/GPUModel/Qwen3-ForcedAligner-0.6B/ (不動)",
+    "audio_io": "qwen/audio_io.py (load_audio_16k_mono)",
+    "downloader": "qwen/downloader.py (SSL/續傳可重用)"
+  },
+  "tasks": [
+    {
+      "id": "ENV-1",
+      "phase": "setup",
+      "owner": "claude",
+      "status": "done",
+      "title": "建立獨立訓練 venv（不污染生產系統 Python）",
+      "detail": "建 finetune\\venv-train，用 --system-site-packages 繼承系統 torch/qwen_asr/peft/accelerate/soundfile/soxr/opencc，避免重抓 torch+cu128。",
+      "depends_on": []
+    },
+    {
+      "id": "ENV-2",
+      "phase": "setup",
+      "owner": "claude",
+      "status": "done",
+      "title": "安裝缺少的訓練套件 datasets + jiwer",
+      "detail": "在訓練 venv 安裝 datasets、jiwer（外加 opencc-python-reimplemented 若 venv 看不到）。不升級 transformers。",
+      "depends_on": [
+        "ENV-1"
+      ]
+    },
+    {
+      "id": "ENV-3",
+      "phase": "setup",
+      "owner": "claude",
+      "status": "in_progress",
+      "title": "下載 Qwen/Qwen3-ASR-0.6B (non-hf) 到本機",
+      "detail": "huggingface 下載 non-hf 0.6B 權重，放固定路徑（如 GPUModel\\Qwen3-ASR-0.6B 或 D:\\models）。煙霧/首跑用。",
+      "depends_on": []
+    },
+    {
+      "id": "ENV-4",
+      "phase": "setup",
+      "owner": "claude",
+      "status": "done",
+      "title": "建立 dataset 目錄結構",
+      "detail": "dataset/{raw/<speaker>,wav16/<speaker>,clips/<split>,manifests}；lexicon.tsv 占位。clipid 用純整數避免 Windows CJK mojibake。",
+      "depends_on": []
+    },
+    {
+      "id": "DATA-1",
+      "phase": "data",
+      "owner": "claude",
+      "status": "done",
+      "title": "下載官方字幕軌＋最佳音訊（yt-dlp）",
+      "detail": "yt-dlp 抓最佳音訊 + 創作者字幕（--write-subs --sub-langs \"zh-Hant,zh-TW,zh\" --no-write-auto-subs；缺退 zh-Hans）。依 yt1..yt5 標 speaker，記 video id/時長。可重用 downloader.py 的 SSL/續傳。輸出 raw/<speaker>/<id>.{m4a,srt}。",
+      "depends_on": [
+        "ENV-4"
+      ]
+    },
+    {
+      "id": "DATA-2",
+      "phase": "data",
+      "owner": "claude",
+      "status": "in_progress",
+      "title": "轉 16k mono",
+      "detail": "audio_io.load_audio_16k_mono → wav16/<speaker>/<id>.wav。16kHz mono 16-bit PCM。保留 BGM/SFX、不去噪。",
+      "depends_on": [
+        "DATA-1"
+      ]
+    },
+    {
+      "id": "DATA-3",
+      "phase": "data",
+      "owner": "claude",
+      "status": "done",
+      "title": "SRT 解析＋文字清理（cue 級，B 缺口）",
+      "detail": "去 <...> HTML/font 標籤、去 [音樂]/(笑聲)/♪/【】 類非語音註記、cue 內換行併一行、去 speaker 標籤/emoji；整條空或純註記 cue 丟棄；雙語疊行只留中文。",
+      "depends_on": [
+        "DATA-1"
+      ]
+    },
+    {
+      "id": "DATA-4",
+      "phase": "data",
+      "owner": "both",
+      "status": "pending",
+      "title": "對齊驗證（A 缺口）",
+      "detail": "每部抽查 5-10 條 cue 聽對齊、偵測整體偏移（片頭/廣告）。必要時用 Qwen3-ForcedAligner 對『清理後文字＋全長音訊』重對齊取乾淨詞級時間。偏移無法修者整部剔除並記錄。聽音校驗需 user。",
+      "depends_on": [
+        "DATA-2",
+        "DATA-3"
+      ]
+    },
+    {
+      "id": "DATA-5",
+      "phase": "data",
+      "owner": "both",
+      "status": "in_progress",
+      "title": "建 canonical lexicon（C 缺口，前置子任務）",
+      "detail": "全寶可夢 zh-TW 名單（種族/招式/道具/特性，來源神奇寶貝百科/wiki CSV）為底 + 從清理字幕抽高頻候選 → 人工定 lexicon.tsv（canonical 中文為主、別名/異拼、保留英文 Mega/Tera/Z）；pokemon.txt 併入擴充。人工定案需 user。",
+      "depends_on": [
+        "DATA-3"
+      ]
+    },
+    {
+      "id": "DATA-6",
+      "phase": "data",
+      "owner": "claude",
+      "status": "done",
+      "title": "cue 合併切片",
+      "detail": "清理後 cue 依 8-12s 視窗合併（≥8s 累積／>0.6s 間隔或 ≥12s 斷／不切 cue 中間／硬上限 30s），依 [首 cue start, 末 cue end]（或重對齊時間）切 clips/，clipid 用整數。切在 VAD 靜音可重用 app-gpu.py Silero VAD。",
+      "depends_on": [
+        "DATA-4"
+      ]
+    },
+    {
+      "id": "DATA-7",
+      "phase": "data",
+      "owner": "both",
+      "status": "done",
+      "title": "正規化＋專名校正",
+      "detail": "text 套版本化正規化（全形英數→半形＋空白收斂，**不做 OpenCC**，見 normalization_decision）；專名位置對 lexicon.tsv 做保守替換；保留 raw_text。專名抽查需 user。",
+      "depends_on": [
+        "DATA-6",
+        "DATA-5"
+      ]
+    },
+    {
+      "id": "DATA-8",
+      "phase": "data",
+      "owner": "claude",
+      "status": "done",
+      "title": "語言標記",
+      "detail": "以 zh 為主，偵測到日文段才標 ja。",
+      "depends_on": [
+        "DATA-7"
+      ]
+    },
+    {
+      "id": "DATA-9",
+      "phase": "data",
+      "owner": "claude",
+      "status": "done",
+      "title": "輸出 manifest＋分割（train/val/test/replay）",
+      "detail": "test=yt5 整組（speaker-disjoint，~45min/3部）；val=yt1+yt2+yt3+yt4 各部時間尾段~10%（early-stop）；其餘為 train。manifests/{train,val,test,replay}.jsonl。欄位：audio/text/raw_text/duration/lang/speaker/context。",
+      "depends_on": [
+        "DATA-8"
+      ]
+    },
+    {
+      "id": "DATA-10",
+      "phase": "data",
+      "owner": "claude",
+      "status": "done",
+      "title": "QA 驗證閘（G 缺口，訓練前必過）",
+      "detail": "逐筆檢查 audio 存在、sr=16k mono、duration 與檔案相符、text 非空、無段 >30s、lang∈{zh,ja}、手建 labels tokenize round-trip 成功且 (labels!=-100).sum()>0。任一失敗列報、不入訓練集。",
+      "depends_on": [
+        "DATA-9"
+      ]
+    },
+    {
+      "id": "DATA-11",
+      "phase": "data",
+      "owner": "claude",
+      "status": "skipped(不需replay,遺忘抽查通過)",
+      "title": "通用 replay 語料（首跑即納入）",
+      "detail": "Common Voice zh-TW（HF datasets，16k 零標註）3-5h，不夠加 AISHELL/download_video 校正段；in:general ≈ 1:1-1:2，獨立 replay.jsonl，正規化同套。另取 CV held-out 一小段當通用 zh test 監控遺忘。",
+      "depends_on": [
+        "ENV-2"
+      ]
+    },
+    {
+      "id": "TRAIN-0",
+      "phase": "harness",
+      "owner": "claude",
+      "status": "done",
+      "title": "建 label 建構模組（手建 labels，ERROR-3/4）",
+      "detail": "依 prompt_template.json 手組 input_ids/labels：動態定位 audio_pad(151676)，只監督 language_suffix+轉錄+eos。含長度==與 (labels!=-100).sum() 斷言。round-trip 自測。",
+      "depends_on": [
+        "ENV-3"
+      ]
+    },
+    {
+      "id": "TRAIN-1",
+      "phase": "harness",
+      "owner": "claude",
+      "status": "done",
+      "title": "建 collator（padding input_ids/attention_mask/input_features/feature_attention_mask/labels）",
+      "detail": "labels 長度必須==input_ids、padding 填 -100。",
+      "depends_on": [
+        "TRAIN-0"
+      ]
+    },
+    {
+      "id": "TRAIN-2",
+      "phase": "harness",
+      "owner": "claude",
+      "status": "done",
+      "title": "建訓練 wrapper（BLOCKER-1：forward 路由到 thinker 取 loss）",
+      "detail": "subclass override top-level forward 委派到 model.thinker(input_ids,labels).loss，或自寫 train loop；保 top-level generate() 仍可走。",
+      "depends_on": [
+        "TRAIN-0"
+      ]
+    },
+    {
+      "id": "TRAIN-3",
+      "phase": "harness",
+      "owner": "claude",
+      "status": "done",
+      "title": "掛 LoRA（BLOCKER-2：精確 regex target_modules）",
+      "detail": "凍結 audio encoder+projector+embedding，LoRA 只掛 thinker 文字層。print_trainable_parameters() 驗證 audio tower 0 命中。gradient_checkpointing_enable + enable_input_require_grads。",
+      "depends_on": [
+        "TRAIN-2"
+      ]
+    },
+    {
+      "id": "TRAIN-4",
+      "phase": "harness",
+      "owner": "claude",
+      "status": "done",
+      "title": "backward smoke test（接線驗證）",
+      "detail": "20-30 句：loss 非 NaN、單調下降、LoRA 有 grad、audio_tower .grad is None、labels 長度==input_ids、過擬合到 loss≈0、patch 後 generate() 可走。",
+      "depends_on": [
+        "TRAIN-3",
+        "TRAIN-1"
+      ]
+    },
+    {
+      "id": "EVAL-0",
+      "phase": "eval-harness",
+      "owner": "claude",
+      "status": "done",
+      "title": "建評測腳本（CER/WER + entity-F1）",
+      "detail": "jiwer WER + 字元級 CER（CJK 去空白字元切分）；解碼後剝 language<asr_text> 標籤；ref/hyp 同一版本化正規化（s2twp→去標點→去空白→字元切分）。entity-F1：以 canonical lexicon 正規化後匹配、per-term exact、macro F1+recall。pokemon.txt 先轉 canonical TSV 才當 eval 詞表。",
+      "depends_on": [
+        "DATA-5"
+      ]
+    },
+    {
+      "id": "P0-1",
+      "phase": "phase0",
+      "owner": "both",
+      "status": "done",
+      "title": "Phase 0：偏置基準（B0/B1）",
+      "detail": "手工校正 10-15 分≈80-120 段小評測集 + canonical 詞表~50-150 條。現有 1.7B 跑偏置 OFF(B0)/ON(B1)，量 CER+entity-F1。B1=要打敗的真 floor。里程碑 M0：產出 B0/B1 表。",
+      "depends_on": [
+        "EVAL-0",
+        "DATA-3"
+      ]
+    },
+    {
+      "id": "P1-1",
+      "phase": "phase1",
+      "owner": "claude",
+      "status": "done",
+      "title": "Phase 1：0.6B LoRA 煙霧",
+      "detail": "20-30 分≈150-250 段（yt1 任一部），r=8、alpha=16、dropout 0.05-0.1、LR 1e-4-2e-4、warmup 5%、≤3 epoch。held-out 5 分算 CER（值不重要，證流程通）。",
+      "depends_on": [
+        "TRAIN-4",
+        "EVAL-0"
+      ]
+    },
+    {
+      "id": "P1-2",
+      "phase": "phase1",
+      "owner": "claude",
+      "status": "done",
+      "title": "merge + 重組完整目錄 + 載入相容性閘（ERROR-5）",
+      "detail": "LoRA merge_and_unload → 重組完整 top-level 目錄 → qwen_asr.Qwen3ASRModel.from_pretrained(新目錄) → 3 段 transcribe() 出字 → parse_asr_output() 無例外。放 GPUModel\\pkm-ft-v0\\。",
+      "depends_on": [
+        "P1-1"
+      ]
+    },
+    {
+      "id": "P1-GATE",
+      "phase": "phase1",
+      "owner": "claude",
+      "status": "done",
+      "title": "M1 Gate（全部成立才前進）",
+      "detail": "loss 單調下降 ∧ 30 句過擬合 loss≈0 ∧ LoRA 有 grad/audio_tower 無 grad ∧ held-out CER 算得出 ∧ merge 後完整目錄經 app-gpu.py/qwen_asr 載入且 parse_asr_output 正常。Fail→修接線不前進。",
+      "depends_on": [
+        "P1-2"
+      ]
+    },
+    {
+      "id": "P2-1",
+      "phase": "phase2",
+      "owner": "claude",
+      "status": "done",
+      "title": "Phase 2：首個真實 LoRA",
+      "detail": "train~8.9h（yt1+yt2+yt3+yt4，4 講者）+ 3-10h 通用 replay（in:general≈1:1-1:2）。r=16、alpha=32、early-stop 看 val CER+entity-F1、replay 1:1-1:2、推理開 scoped 偏置。",
+      "depends_on": [
+        "P1-GATE",
+        "DATA-10",
+        "DATA-11"
+      ]
+    },
+    {
+      "id": "P2-2",
+      "phase": "phase2",
+      "owner": "claude",
+      "status": "done",
+      "title": "Phase 2 評測（B0/B1/B2 三並排，speaker-disjoint）",
+      "detail": "B0=base 偏置OFF；B1=base 偏置ON（真 floor）；B2=base+LoRA 偏置ON。三組指標：整體 CER/WER、術語 entity-F1/term-error（yt5 hold-out 術語測試集 200-500 句）、通用域 CER（遺忘）。",
+      "depends_on": [
+        "P2-1",
+        "EVAL-0"
+      ]
+    },
+    {
+      "id": "P2-GATE",
+      "phase": "phase2",
+      "owner": "both",
+      "status": "done",
+      "title": "M2 Go/No-Go 閘",
+      "detail": "No-Go to 1.7B/出 0.6B：B2 達標。Go to 1.7B：B2 明顯贏 B1（CER -≥2pts ∧ entity-F1 +≥3pts）但未達標。STOP（去補詞表/資料）：B2 entity-F1 提升<2-3pts over B1。遺忘守門：通用 zh 退化→replay 提 1:2-1:3/降 LR。拍板需 user。",
+      "depends_on": [
+        "P2-2"
+      ]
+    },
+    {
+      "id": "P3-1",
+      "phase": "phase3",
+      "owner": "both",
+      "status": "done",
+      "title": "Phase 3（條件觸發）：上 1.7B 或擴至 10-50h",
+      "detail": "僅當 M2 證明擴模型/擴資料確有收益。同配方上 Qwen3-ASR-1.7B 或收至 10-50h（需再收影片/講者，yt4/yt5 可補）。M3：speaker-robust 域內準確率+術語達標+過全套相容/A-B。",
+      "depends_on": [
+        "P2-GATE"
+      ]
+    },
+    {
+      "id": "DEPLOY-1",
+      "phase": "deploy",
+      "owner": "both",
+      "status": "deferred(UI 使用者要求之後再做)",
+      "title": "生產 A/B + 切換上線",
+      "detail": "固定 held-out 影片，app-gpu.py 分別指向原始 vs pkm-ft-vN，比 CER/entity-F1+人工抽查字幕分行；通過才改 ASR_MODEL_NAME(app-gpu.py:63) 或 model_tab.py 路徑指向新模型，舊目錄留回滾。caveat：faster-whisper/CTranslate2/CPU OpenVINO 吃不了此微調，只整合 PyTorch 路徑。 【新增】評估關閉/調整生產 OpenCC s2t/s2twp（微調後會破壞正確專名）。 【UI 需求】模型選擇器(預設pkm-ft-1.7b-v1/可選原始1.7B)+OpenCC on/off 開關；後端勘查見 結果.md §8。",
+      "depends_on": [
+        "P2-GATE"
+      ]
+    }
+  ],
+  "split_policy": {
+    "decision": "使用者修正：test 用 yt5（非 yt3）",
+    "test_speaker_holdout": "yt5（3 部，~45min）— speaker-disjoint，達 30-60min/200-500 句目標",
+    "train": "yt1+yt2+yt3+yt4（~8.9h，4 講者；含 yt3/yt4 增加講者多樣性）",
+    "val": "各 train 影片時間尾段 ~10%（in-distribution，early-stop）",
+    "note": "yt4 字幕是 zh（非 zh-TW），正規化 s2twp 後併入；增加區域多樣性"
+  },
+  "normalization_decision": {
+    "decision": "不做 OpenCC 繁簡/詞彙轉換（norm-v2-no-opencc）",
+    "evidence": "來源字幕本為乾淨 zh-TW；實測 s2twp 破壞專名(岩崩→巖崩/仆斬將軍→僕斬將軍/洛托姆→洛託姆/類型→型別)，s2t 字元級也把通用字誤判(岩/仆/只/吃/才/系/群/托)。真簡體字<0.3%且多假陽性。",
+    "keep": "全形英數→半形、空白收斂、for_cer(去標點/字元切分/英文小寫)。ref/hyp 共用同函式。",
+    "text_correction": "只靠 canonical lexicon(DATA-5) 對已知專名錯拼做保守替換。",
+    "PRODUCTION_FINDING": "app-gpu.py:598 對輸出套 OpenCC(預設s2t,詞彙開則s2twp) 同樣破壞專名；微調後模型原生輸出正確 zh-TW，該步驟變多餘且有害 → 部署時建議關閉(輸出模式設原樣/或停 OpenCC)。"
+  },
+  "dataset_stats": {
+    "train": "2452 clips/7.31h (yt1-4)",
+    "val": "273/0.80h",
+    "test": "204/0.67h≈40min (yt5)",
+    "total_clips": 2929,
+    "qa": "ALL PASS",
+    "window": "8-12s 均值10.7s 上限30s"
+  },
+  "M0_baseline": {
+    "eval_set": "yt5 test 60/204 clips（初步，full 待跑）",
+    "scoring": "for_cer 對 ref/hyp 對稱 t2s 書寫中性化 + 去標點，entity 對 lexicon",
+    "B0_1.7B_off": {
+      "CER": 0.217,
+      "entity_microF": 0.712,
+      "recall": 0.553
+    },
+    "B1_1.7B_bias": {
+      "CER": 0.194,
+      "entity_microF": 0.894,
+      "recall": 0.809,
+      "note": "真 floor，B2 要打敗"
+    },
+    "note": "偏置把 entity recall 0.55→0.81。CER 含創作者字幕可能略縮寫的不可約成分（對各變體一致）。"
+  },
+  "M2_results_0.6b_noreplay": {
+    "eval": "yt5 test 60 clips, for_cer t2s 中性化",
+    "table": {
+      "0.6B_base_off": {
+        "CER": 0.249,
+        "entF": 0.638,
+        "recall": 0.468
+      },
+      "0.6B_base_bias": {
+        "CER": 0.234,
+        "entF": 0.765,
+        "recall": 0.66
+      },
+      "0.6B_LoRA_off": {
+        "CER": 0.222,
+        "entF": 0.894,
+        "recall": 0.809
+      },
+      "0.6B_LoRA_bias": {
+        "CER": 0.236,
+        "entF": 0.729,
+        "recall": 0.83,
+        "note": "FP21 偏置反傷"
+      },
+      "1.7B_base_off_B0": {
+        "CER": 0.217,
+        "entF": 0.712,
+        "recall": 0.553
+      },
+      "1.7B_bias_B1_floor": {
+        "CER": 0.194,
+        "entF": 0.894,
+        "recall": 0.809
+      }
+    },
+    "findings": [
+      "LoRA 在 0.6B 同基座增益巨大：entity-F 0.638→0.894(+25.6pt)、recall 0.468→0.809(+34pt)、CER 0.249→0.222。配方有效。",
+      "0.6B+LoRA(off) 已追平 1.7B+bias(B1) 的 entity(0.894/0.809)，模型小 3 倍且免偏置。",
+      "0.6B+LoRA CER 0.222 仍輸 1.7B+bias 0.194（0.6B 基座聲學較弱）。",
+      "偏置反傷微調後模型(FP21)：部署應關偏置或極輕。"
+    ],
+    "decision": "GO to 1.7B（Phase 3）：配方對小基座證明有效，0.6B 受限基座聲學；同配方上 1.7B 應同時贏 CER 與 entity。部署偏置 OFF。",
+    "caveats": [
+      "僅 60 clips（full 204 待跑）",
+      "無 replay（通用 zh 遺忘未測）",
+      "lexicon 僅 18 詞（entity-F1 覆蓋有限）"
+    ]
+  },
+  "M3_results_1.7b_full204": {
+    "eval": "yt5 test FULL 204 clips, for_cer t2s 中性化, lexicon 11 terms in ref",
+    "B1_floor_1.7B_bias": {
+      "CER": 0.2162,
+      "entF": 0.866,
+      "recall": 0.764
+    },
+    "B2_1.7B_LoRA_off": {
+      "CER": 0.1993,
+      "entF": 0.933,
+      "recall": 0.882,
+      "note": "部署設定，勝 floor"
+    },
+    "B2_1.7B_LoRA_bias": {
+      "CER": 0.1987,
+      "entF": 0.935,
+      "recall": 0.906,
+      "note": "偏置對1.7B微調略增recall(+4FP)"
+    },
+    "win_vs_floor": "CER -1.7pt, entity-F +6.7pt, recall +11.8pt；原生繁體輸出免OpenCC",
+    "model_path": "GPUModel/pkm-ft-1.7b-v1 (單檔 model.safetensors，qwen_asr 已載入+transcribe 204成功=載入閘通過)",
+    "REMAINING_RISK": "此模型 NO REPLAY → 通用 zh 遺忘未測，生產 app 也做一般轉錄，須先驗證/補 replay 再上線。"
+  },
+  "forgetting_check": {
+    "general_set": "YouTube DOoWigrKX2s 台灣新聞節目 133 clips/24min（非寶可夢域，創作者繁中字幕）",
+    "base_1.7B_CER": 0.2194,
+    "ft_1.7B_CER": 0.1948,
+    "verdict": "無災難遺忘，微調反而更好（-2.5pt）。訓練資料台灣繁中口語強化台灣國語處理。不需 replay。"
+  },
+  "V4_results_term_fix": {
+    "date": "2026-06-29",
+    "goal": "修 V3 實測三詞誤判：撒嬌→沙雕、戲法空間→細化空間、仙子伊布→先一步",
+    "root_cause": "非標籤汙染（錯誤詞從未出現於任何標籤）；訓練訊號弱：撒嬌15 clip、戲法空間2、仙子伊布0（只在 yt5 測試集）",
+    "method": "manifest 層重組（不重跑 02/03/04，clip 已切好）：yt5 h51REmf4JNY→train 補三詞；其餘2部yt5(Jwy3M2W987c,VM6LcDCdV1M)留 hold-out；yt4 NTt8wMs6OUE→test 補時長。train_lora 內建 --replay 過取樣三詞 ×8。",
+    "manifests": "train.v4 4529clip/13.16h(撒嬌16/戲法6/仙子7)、val.v4=val.yt1 497(無三詞,僅監控)、test.v4 326(hold-out 戲法~14/仙子~9,撒嬌0)、replay.v4 27clip×8=216列",
+    "train": "配方同 v2/v3，--out adapters/p3-1.7b-v4，best_val 0.2190(ep1)",
+    "checkpoint_sweep": "val.v4 無三詞→best-by-val 會偏；掃 best/last 在 test.v4+撒嬌實測切片逐詞比，採 last(三詞最佳、FP最低、CER幾乎不變)",
+    "holdout_term_recall": {
+      "戲法空間": "V3 3/14 → V4 9/14",
+      "仙子伊布": "V3 0/9 → V4 5/9",
+      "撒嬌": "實測切片 V3✓ V4✓（離線無法重現 production 沙雕）"
+    },
+    "test_v4_metrics_last": {
+      "CER": 0.1125,
+      "entity_microF": 0.926,
+      "recall": 0.869,
+      "FP": 1
+    },
+    "caveat": "撒嬌離線(18s長窗+~4s短窗) V3/V4 皆正確輸出『撒嬌』→ production 變沙雕應為 app 端 VAD 切窗/解碼路徑(非裸模型)，須在 app 選 v4 重轉 Fiske 片確認；若仍錯查 app 切窗。test.v4 組成異於 v2/v3 舊test(3部yt5)→CER 不可跨版直接比。",
+    "model_path": "GPUModel/pkm-ft-1.7b-v4（採 last 檢查點；非預設，下拉可選）",
+    "deploy": "不改預設(仍 pkm-ft-1.7b-v2)；app 驗收通過後再考慮改 _PREFERRED_GPU_MODEL 指向 v4",
+    "new_files": [
+      "scripts/make_v4_split.py",
+      "scripts/make_v4_replay.py",
+      "dataset/manifests/{train,val,test}.v4.jsonl + replay.v4.jsonl",
+      "adapters/p3-1.7b-v4/{best,epoch0..2,last}",
+      "GPUModel/pkm-ft-1.7b-v4/",
+      "reports/B2_1.7b_v4_{best,last}_off.json",
+      "dataset/lexicon.tsv(+撒嬌/戲法空間/仙子伊布)"
+    ]
+  },
+  "handoff_doc": "finetune/結果.md（成果/數字/踩坑/檔案地圖/後續，給後續 agent）"
+}

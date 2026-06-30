@@ -15,11 +15,14 @@ REM   Step 3 launches the CustomTkinter desktop app (app-gpu.py).
 REM   For a web interface, use the built-in Endpoint tab instead.
 REM ============================================================
 
-REM All GPU resources live under cudagpu\ (scripts, models, venv).
+REM Release builds keep GPU resources under cudagpu\, while source clones
+REM keep app-gpu.py and models at the repository root. Support both layouts.
 set "SCRIPT_DIR=%~dp0cudagpu\"
-if not exist "%SCRIPT_DIR%" (
-    echo  [ERROR] cudagpu folder not found next to start-gpu.bat.
-    echo          Expected: %SCRIPT_DIR%
+if not exist "%SCRIPT_DIR%app-gpu.py" set "SCRIPT_DIR=%~dp0"
+if not exist "%SCRIPT_DIR%app-gpu.py" (
+    echo  [ERROR] app-gpu.py not found.
+    echo          Expected either: %~dp0cudagpu\app-gpu.py
+    echo                    or: %~dp0app-gpu.py
     pause & exit /b 1
 )
 set "GPU_MODEL_DIR=%SCRIPT_DIR%GPUModel"
