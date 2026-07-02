@@ -76,7 +76,19 @@ SUPPORTED_LANGUAGES = [
 SAMPLE_RATE          = 16000
 VAD_CHUNK            = 512
 VAD_THRESHOLD        = 0.5
-MAX_GROUP_SEC        = 20
+VAD_GAP_FILL_THRESHOLD = 0.35
+VAD_MIN_CHUNKS      = 16
+VAD_PAD_CHUNKS      = 5
+VAD_MERGE_CHUNKS    = 16
+VAD_TAIL_SEC        = 1.8
+VAD_TARGET_GROUP_SEC = 12.0
+VAD_MAX_GROUP_SEC   = 18.0
+VAD_SPLIT_SEARCH_SEC = 3.0
+VAD_GAP_FILL_MIN_SEC = 5.0
+VAD_GAP_FILL_FORCE_SEC = 8.0
+VAD_GAP_FILL_CHUNK_SEC = 8.0
+VAD_FORCE_MIN_RMS   = 0.003
+MAX_GROUP_SEC        = VAD_MAX_GROUP_SEC
 OFFICIAL_CHUNK_MINUTES_DEFAULT = 5.0
 MAX_CHARS            = 20
 MIN_SUB_SEC          = 0.6
@@ -95,61 +107,223 @@ _EN_SENT_END   = frozenset('.,!?;')
 # 共用工具函式（與 app.py 相同）
 # ══════════════════════════════════════════════════════
 
-def _detect_speech_groups(audio: np.ndarray, vad_sess) -> list[tuple[float, float, np.ndarray]]:
-    """Silero VAD 分段，回傳 [(start_s, end_s, chunk), ...]"""
+def _asr_diag(message: str) -> None:
+    """Lightweight diagnostic log for ASR segmentation issues."""
+    try:
+        print(f"[ASR][diag] {message}", flush=True)
+    except Exception:
+        pass
+
+
+def _sec_to_vad_chunks(seconds: float) -> int:
+    return max(1, int(round(seconds * SAMPLE_RATE / VAD_CHUNK)))
+
+
+def _run_vad_probs(audio: np.ndarray, vad_sess) -> list[float]:
     h  = np.zeros((2, 1, 64), dtype=np.float32)
     c  = np.zeros((2, 1, 64), dtype=np.float32)
     sr = np.array(SAMPLE_RATE, dtype=np.int64)
     n  = len(audio) // VAD_CHUNK
-    probs = []
+    probs: list[float] = []
     for i in range(n):
         chunk = audio[i*VAD_CHUNK:(i+1)*VAD_CHUNK].astype(np.float32)[np.newaxis, :]
         out, h, c = vad_sess.run(None, {"input": chunk, "h": h, "c": c, "sr": sr})
         probs.append(float(out[0, 0]))
-    if not probs:
-        return [(0.0, len(audio) / SAMPLE_RATE, audio)]
+    return probs
 
-    MIN_CH = 16; PAD = 5; MERGE = 16
+
+def _split_long_vad_range(start_ch: int, end_ch: int, probs: list[float]) -> list[tuple[int, int]]:
+    """Split one over-merged VAD range into ASR-safe ranges."""
+    max_ch = _sec_to_vad_chunks(VAD_MAX_GROUP_SEC)
+    if end_ch - start_ch <= max_ch:
+        return [(start_ch, end_ch)]
+
+    target_ch = _sec_to_vad_chunks(VAD_TARGET_GROUP_SEC)
+    search_ch = _sec_to_vad_chunks(VAD_SPLIT_SEARCH_SEC)
+    min_piece_ch = _sec_to_vad_chunks(3.0)
+    pieces: list[tuple[int, int]] = []
+    cur = start_ch
+
+    while end_ch - cur > max_ch:
+        target = min(cur + target_ch, end_ch)
+        lo = max(cur + min_piece_ch, target - search_ch)
+        hi = min(end_ch - min_piece_ch, target + search_ch)
+        split_ch = None
+        if hi > lo:
+            window = probs[lo:hi]
+            if window:
+                lowest = lo + min(range(len(window)), key=window.__getitem__)
+                split_ch = min(max(lowest + 1, cur + min_piece_ch), end_ch - min_piece_ch)
+        if split_ch is None or split_ch <= cur:
+            split_ch = min(cur + max_ch, end_ch - min_piece_ch)
+        if split_ch <= cur:
+            break
+        pieces.append((cur, split_ch))
+        cur = split_ch
+
+    if cur < end_ch:
+        pieces.append((cur, end_ch))
+    return pieces
+
+
+def _slice_vad_group(
+    audio: np.ndarray,
+    start_s: float,
+    end_s: float,
+    tail_sec: float = VAD_TAIL_SEC,
+) -> tuple[float, float, np.ndarray] | None:
+    start_s = max(0.0, float(start_s))
+    end_s = min(len(audio) / SAMPLE_RATE, max(start_s, float(end_s)))
+    if end_s - start_s < 0.5:
+        return None
+    s = max(0, int(round(start_s * SAMPLE_RATE)))
+    e = min(len(audio), int(round(end_s * SAMPLE_RATE)))
+    tail = int(max(0.0, tail_sec) * SAMPLE_RATE)
+    chunk = audio[s:min(len(audio), e + tail)].astype(np.float32)
+    if len(chunk) < SAMPLE_RATE // 2:
+        return None
+    return start_s, end_s, chunk
+
+
+def _finalize_vad_groups(audio: np.ndarray, groups_ch: list[tuple[int, int]]) -> list[tuple[float, float, np.ndarray]]:
+    result: list[tuple[float, float, np.ndarray]] = []
+    for idx, (gs, ge) in enumerate(groups_ch):
+        start_s = gs * VAD_CHUNK / SAMPLE_RATE
+        end_s = ge * VAD_CHUNK / SAMPLE_RATE
+        if idx + 1 < len(groups_ch):
+            next_start_s = groups_ch[idx + 1][0] * VAD_CHUNK / SAMPLE_RATE
+            tail_sec = min(VAD_TAIL_SEC, max(0.0, next_start_s - end_s))
+        else:
+            tail_sec = VAD_TAIL_SEC
+        group = _slice_vad_group(audio, start_s, end_s, tail_sec=tail_sec)
+        if group is not None:
+            result.append(group)
+    return result
+
+
+def _detect_speech_groups(
+    audio: np.ndarray,
+    vad_sess,
+    threshold: float | None = None,
+    diag_label: str | None = None,
+) -> list[tuple[float, float, np.ndarray]]:
+    """Silero VAD 分段，回傳 [(start_s, end_s, chunk), ...]。
+
+    Short groups preserve the legacy behavior. Only over-merged long ranges are
+    split by low-energy points so each ASR call stays below the token ceiling.
+    """
+    if threshold is None:
+        threshold = VAD_THRESHOLD
+    probs = _run_vad_probs(audio, vad_sess)
+    n = len(probs)
+    if not probs:
+        return [(0.0, len(audio) / SAMPLE_RATE, audio)] if len(audio) else []
+
     raw: list[tuple[int, int]] = []
     in_sp = False; s0 = 0
     for i, p in enumerate(probs):
-        if p >= VAD_THRESHOLD and not in_sp:
+        if p >= threshold and not in_sp:
             s0 = i; in_sp = True
-        elif p < VAD_THRESHOLD and in_sp:
-            if i - s0 >= MIN_CH:
-                raw.append((max(0, s0-PAD), min(n, i+PAD)))
+        elif p < threshold and in_sp:
+            if i - s0 >= VAD_MIN_CHUNKS:
+                raw.append((max(0, s0 - VAD_PAD_CHUNKS), min(n, i + VAD_PAD_CHUNKS)))
             in_sp = False
-    if in_sp and n - s0 >= MIN_CH:
-        raw.append((max(0, s0-PAD), n))
+    if in_sp and n - s0 >= VAD_MIN_CHUNKS:
+        raw.append((max(0, s0 - VAD_PAD_CHUNKS), n))
     if not raw:
         return []
 
     merged = [list(raw[0])]
     for s, e in raw[1:]:
-        if s - merged[-1][1] <= MERGE:
+        if s - merged[-1][1] <= VAD_MERGE_CHUNKS:
             merged[-1][1] = e
         else:
             merged.append([s, e])
 
-    mx_samp = MAX_GROUP_SEC * SAMPLE_RATE
+    split_ranges: list[tuple[int, int]] = []
+    for s, e in merged:
+        pieces = _split_long_vad_range(s, e, probs)
+        if len(pieces) > 1:
+            label = f" {diag_label}" if diag_label else ""
+            _asr_diag(
+                f"vad long-split{label}: {s * VAD_CHUNK / SAMPLE_RATE:.3f}->"
+                f"{e * VAD_CHUNK / SAMPLE_RATE:.3f}s into {len(pieces)} pieces"
+            )
+        split_ranges.extend(pieces)
+
+    max_ch = _sec_to_vad_chunks(VAD_MAX_GROUP_SEC)
     groups: list[tuple[int, int]] = []
-    gs = merged[0][0] * VAD_CHUNK
-    ge = merged[0][1] * VAD_CHUNK
-    for seg in merged[1:]:
-        s = seg[0] * VAD_CHUNK; e = seg[1] * VAD_CHUNK
-        if e - gs > mx_samp:
+    gs, ge = split_ranges[0]
+    for s, e in split_ranges[1:]:
+        if e - gs > max_ch:
             groups.append((gs, ge)); gs = s
         ge = e
     groups.append((gs, ge))
+    return _finalize_vad_groups(audio, groups)
 
-    result = []
-    _tail = int(0.35 * SAMPLE_RATE)   # 多含尾段 0.35s：補捉 Silero 漏掉的句尾輕聲字（的/了/嗎）
-    for gs, ge in groups:
-        ch = audio[gs: min(len(audio), ge + _tail)].astype(np.float32)
-        if len(ch) < SAMPLE_RATE // 2:      # 最小 0.5 秒
-            continue
-        result.append((gs / SAMPLE_RATE, ge / SAMPLE_RATE, ch))
-    return result
+
+def _fixed_gap_chunks(audio: np.ndarray, gap0: float, gap1: float) -> list[tuple[float, float, np.ndarray]]:
+    groups: list[tuple[float, float, np.ndarray]] = []
+    cur = gap0
+    while gap1 - cur >= 0.5:
+        nxt = min(cur + VAD_GAP_FILL_CHUNK_SEC, gap1)
+        tail_sec = 0.0 if nxt < gap1 else VAD_TAIL_SEC
+        group = _slice_vad_group(audio, cur, nxt, tail_sec=tail_sec)
+        if group is not None:
+            groups.append(group)
+        cur = nxt
+    return groups
+
+
+def _fill_vad_group_gaps(
+    audio: np.ndarray,
+    groups: list[tuple[float, float, np.ndarray]],
+    vad_sess,
+    base_offset: float = 0.0,
+) -> list[tuple[float, float, np.ndarray]]:
+    """Fill large uncovered VAD group gaps without touching normal subtitle gaps."""
+    if len(groups) < 2:
+        return groups
+
+    groups = sorted(groups, key=lambda g: (g[0], g[1]))
+    filled: list[tuple[float, float, np.ndarray]] = []
+    for group in groups:
+        if filled:
+            gap0 = filled[-1][1]
+            gap1 = group[0]
+            gap = gap1 - gap0
+            if gap > VAD_GAP_FILL_MIN_SEC:
+                s = max(0, int(round(gap0 * SAMPLE_RATE)))
+                e = min(len(audio), int(round(gap1 * SAMPLE_RATE)))
+                gap_audio = audio[s:e]
+                low_groups = _detect_speech_groups(
+                    gap_audio,
+                    vad_sess,
+                    threshold=VAD_GAP_FILL_THRESHOLD,
+                    diag_label=f"gap {base_offset + gap0:.1f}-{base_offset + gap1:.1f}",
+                )
+                inserts = [(gap0 + g0, gap0 + g1, chunk) for g0, g1, chunk in low_groups]
+                if inserts:
+                    _asr_diag(
+                        f"vad gap-fill: {base_offset + gap0:.3f}->{base_offset + gap1:.3f}s "
+                        f"gap={gap:.3f}s inserts={len(inserts)}"
+                    )
+                elif gap > VAD_GAP_FILL_FORCE_SEC:
+                    rms = float(np.sqrt(np.mean(gap_audio.astype(np.float32) ** 2))) if len(gap_audio) else 0.0
+                    if rms >= VAD_FORCE_MIN_RMS:
+                        inserts = _fixed_gap_chunks(audio, gap0, gap1)
+                        _asr_diag(
+                            f"vad gap-fill forced: {base_offset + gap0:.3f}->{base_offset + gap1:.3f}s "
+                            f"gap={gap:.3f}s rms={rms:.5f} chunks={len(inserts)}"
+                        )
+                    else:
+                        _asr_diag(
+                            f"vad gap-fill skipped low-energy gap: {base_offset + gap0:.3f}->"
+                            f"{base_offset + gap1:.3f}s gap={gap:.3f}s rms={rms:.5f}"
+                        )
+                filled.extend(inserts)
+        filled.append(group)
+    return sorted(filled, key=lambda g: (g[0], g[1]))
 
 
 def _split_to_lines(text: str, break_on_space: bool = False) -> list[str]:
@@ -750,17 +924,40 @@ class GPUASREngine:
                         chunk, t0, spk, self.official_chunk_sec
                     ))
                 else:
-                    groups_spk.append((t0, t1, chunk, spk))
+                    vad_groups = _detect_speech_groups(
+                        chunk, self.vad_sess, diag_label=f"diar {t0:.1f}-{t1:.1f} {spk}"
+                    )
+                    vad_groups = _fill_vad_group_gaps(
+                        chunk, vad_groups, self.vad_sess, base_offset=t0
+                    )
+                    if not vad_groups:
+                        _asr_diag(f"vad empty diar segment: {t0:.3f}->{t1:.3f}s spk={spk}")
+                        continue
+                    groups_spk.extend((t0 + g0, t0 + g1, vad_chunk, spk)
+                                      for g0, g1, vad_chunk in vad_groups)
         else:
             if self.segment_mode == "official":
                 groups_spk = _official_split_groups(
                     audio, 0.0, None, self.official_chunk_sec
                 )
             else:
-                vad_groups = _detect_speech_groups(audio, self.vad_sess)
+                vad_groups = _detect_speech_groups(audio, self.vad_sess, diag_label=audio_path.name)
+                vad_groups = _fill_vad_group_gaps(audio, vad_groups, self.vad_sess)
                 if not vad_groups:
+                    _asr_diag(f"vad returned no speech groups for {audio_path.name}")
                     return None
                 groups_spk = [(g0, g1, chunk, None) for g0, g1, chunk in vad_groups]
+
+        groups_spk.sort(key=lambda g: (g[0], g[1]))
+        if self.segment_mode == "vad":
+            durations = [g1 - g0 for g0, g1, _chunk, _spk in groups_spk]
+            gaps = [groups_spk[i + 1][0] - groups_spk[i][1]
+                    for i in range(len(groups_spk) - 1)]
+            _asr_diag(
+                f"vad summary: groups={len(groups_spk)} max={max(durations, default=0):.3f}s "
+                f"over_max={sum(1 for d in durations if d > VAD_MAX_GROUP_SEC):d} "
+                f"gaps>{VAD_GAP_FILL_MIN_SEC:g}s={sum(1 for g in gaps if g > VAD_GAP_FILL_MIN_SEC):d}"
+            )
 
         all_subs: list[tuple[float, float, str, str | None]] = []
         total = len(groups_spk)
