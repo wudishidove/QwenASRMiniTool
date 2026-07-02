@@ -25,49 +25,56 @@
     "id": "5O6yXXJQCYg",
     "wav": "wav16\\yt1\\5O6yXXJQCYg.wav",
     "duration": 4581.23,
-    "status": "ok"
+    "status": "exists"
   },
   {
     "speaker": "yt1",
     "id": "8IAdoWpwk80",
     "wav": "wav16\\yt1\\8IAdoWpwk80.wav",
     "duration": 4187.36,
-    "status": "ok"
+    "status": "exists"
+  },
+  {
+    "speaker": "yt1",
+    "id": "8xmhtLLnvF4",
+    "wav": "wav16\\yt1\\8xmhtLLnvF4.wav",
+    "duration": 924.29,
+    "status": "exists"
   },
   {
     "speaker": "yt1",
     "id": "8ygD7ShM2PE",
     "wav": "wav16\\yt1\\8ygD7ShM2PE.wav",
     "duration": 740.79,
-    "status": "ok"
+    "status": "exists"
   },
   {
     "speaker": "yt1",
     "id": "_a9qgZnsDG8",
     "wav": "wav16\\yt1\\_a9qgZnsDG8.wav",
     "duration": 4772.21,
-    "status": "ok"
+    "status": "exists"
   },
   {
     "speaker": "yt1",
     "id": "ed0e8KviemU",
     "wav": "wav16\\yt1\\ed0e8KviemU.wav",
     "duration": 4069.68,
-    "status": "ok"
+    "status": "exists"
   },
   {
     "speaker": "yt1",
     "id": "f0KaoGhjfw8",
     "wav": "wav16\\yt1\\f0KaoGhjfw8.wav",
     "duration": 4601.8,
-    "status": "ok"
+    "status": "exists"
   },
   {
     "speaker": "yt1",
     "id": "JcGKhnklsyY",
     "wav": "wav16\\yt1\\JcGKhnklsyY.wav",
     "duration": 3838.47,
-    "status": "ok"
+    "status": "exists"
   },
   {
     "speaker": "yt1",
@@ -95,14 +102,14 @@
     "id": "r9kiS91vovo",
     "wav": "wav16\\yt1\\r9kiS91vovo.wav",
     "duration": 3202.33,
-    "status": "ok"
+    "status": "exists"
   },
   {
     "speaker": "yt1",
     "id": "VEeH7XM42TA",
     "wav": "wav16\\yt1\\VEeH7XM42TA.wav",
     "duration": 4737.93,
-    "status": "ok"
+    "status": "exists"
   },
   {
     "speaker": "yt1",
@@ -110,6 +117,13 @@
     "wav": "wav16\\yt1\\ZmCH9tKz6vE.wav",
     "duration": 3546.8,
     "status": "exists"
+  },
+  {
+    "speaker": "yt1",
+    "id": "哪些寶可夢應該優先抽？強勢 Mega 有誰？Champions 全寶可夢強度排名！【寶可夢 Champions】#寶可夢冠軍 #寶可夢對戰 #雙打對戰",
+    "wav": "wav16\\yt1\\哪些寶可夢應該優先抽？強勢 Mega 有誰？Champions 全寶可夢強度排名！【寶可夢 Champions】#寶可夢冠軍 #寶可夢對戰 #雙打對戰.wav",
+    "duration": 4886.64,
+    "status": "ok"
   },
   {
     "speaker": "yt2",

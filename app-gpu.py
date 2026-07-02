@@ -152,7 +152,23 @@ def _split_long_vad_range(start_ch: int, end_ch: int, probs: list[float]) -> lis
         if hi > lo:
             window = probs[lo:hi]
             if window:
-                lowest = lo + min(range(len(window)), key=window.__getitem__)
+                # 優先切在「持續低機率」的真靜音區間（≥3 chunk ≈ 96ms）中點；
+                # 單一 chunk 最低點可能是詞中間 32ms 的局部凹陷 → 切在詞中、兩半各自誤判
+                best_run = None  # (run_len, run_mid)
+                run_s = None
+                for k, p in enumerate(window + [1.0]):  # 尾端哨兵收斂最後一段 run
+                    if p < VAD_GAP_FILL_THRESHOLD:
+                        if run_s is None:
+                            run_s = k
+                    elif run_s is not None:
+                        rl = k - run_s
+                        if rl >= 3 and (best_run is None or rl > best_run[0]):
+                            best_run = (rl, run_s + rl // 2)
+                        run_s = None
+                if best_run is not None:
+                    lowest = lo + best_run[1]
+                else:
+                    lowest = lo + min(range(len(window)), key=window.__getitem__)
                 split_ch = min(max(lowest + 1, cur + min_piece_ch), end_ch - min_piece_ch)
         if split_ch is None or split_ch <= cur:
             split_ch = min(cur + max_ch, end_ch - min_piece_ch)
@@ -348,6 +364,12 @@ def _split_to_lines(text: str, break_on_space: bool = False) -> list[str]:
 
         # ── 標點符號：切行，標點不加入輸出（隱藏）────────────────────
         if ch in _all_punct:
+            # 小數點/千分位：`.` `,` 夾在兩數字間（1.5、1,000）＝數字一部分，不切行
+            if ch in ".," and 0 < i < len(text) - 1 \
+                    and text[i - 1].isdigit() and text[i + 1].isdigit():
+                buf += ch
+                i += 1
+                continue
             if buf.strip():
                 lines.append(buf.strip())
             buf = ""
@@ -577,6 +599,12 @@ def _ts_to_subtitle_lines(
         ch = raw_text[i]
         # 標點 → 切行（標點不輸出）
         if ch in _all_punct:
+            # 小數點/千分位：`.` `,` 夾在兩數字間（1.5、1,000）＝數字一部分，不切行
+            if ch in ".," and 0 < i < L - 1 \
+                    and raw_text[i - 1].isdigit() and raw_text[i + 1].isdigit():
+                cur.append((ch, char_time[i]))
+                i += 1
+                continue
             _emit(); i += 1; continue
         # 英文整字：詞前補分詞空格，MAX_CHARS 保護
         if ch.isalpha() and ord(ch) < 128:
